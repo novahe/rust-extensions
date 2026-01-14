@@ -31,7 +31,11 @@ use cgroups_rs::{
     CgroupPid,
 };
 use containerd_shim_protos::{
-    cgroups::metrics::{CPUStat, CPUUsage, MemoryEntry, MemoryStat, Metrics, PidsStat, Throttle},
+    cgroups::metrics::{
+        CPUStat, CPUUsage, MemoryEntry, MemoryStat, Metrics, PidsStat, Throttle, RdmaStat, RdmaEntry,
+        BlkIOStat, BlkIOEntry, MemoryOomControl, CgroupStats, HugetlbStat, NetworkStat,
+        IOStat, IOEntry, MemoryEvents, HugeTlbStat,
+    },
     protobuf::{well_known_types::any::Any, Message},
     shim::oci::Options,
 };
@@ -112,55 +116,380 @@ fn write_process_oom_score(pid: u32, score: i64) -> Result<()> {
 pub fn collect_metrics(cgroup: &Cgroup) -> Result<Metrics> {
     let mut metrics = Metrics::new();
 
-    // to make it easy, fill the necessary metrics only.
+    // Check if this is a cgroup v2 by examining the hierarchy
+    let is_v2 = cgroup.hierarchy().is_v2();
+    
+    if is_v2 {
+        collect_metrics_v2(cgroup, &mut metrics)?;
+    } else {
+        // to make it easy, fill the necessary metrics only for v1.
+        for sub_system in Cgroup::subsystems(cgroup) {
+            match sub_system {
+                Subsystem::Cpu(cpu_ctr) => {
+                    let mut cpu_usage = CPUUsage::new();
+                    let mut throttle = Throttle::new();
+                    let stat = cpu_ctr.cpu().stat;
+                    for line in stat.lines() {
+                        let parts = line.split(' ').collect::<Vec<&str>>();
+                        if parts.len() != 2 {
+                            Err(Error::Other(format!("invalid cpu stat line: {}", line)))?;
+                        }
+
+                        // https://github.com/opencontainers/runc/blob/dbe8434359ca35af1c1e10df42b1f4391c1e1010/libcontainer/cgroups/fs2/cpu.go#L70
+                        match parts[0] {
+                            "usage_usec" => {
+                                cpu_usage.set_total(parts[1].parse::<u64>().unwrap());
+                            }
+                            "user_usec" => {
+                                cpu_usage.set_user(parts[1].parse::<u64>().unwrap());
+                            }
+                            "system_usec" => {
+                                cpu_usage.set_kernel(parts[1].parse::<u64>().unwrap());
+                            }
+                            "nr_periods" => {
+                                throttle.set_periods(parts[1].parse::<u64>().unwrap());
+                            }
+                            "nr_throttled" => {
+                                throttle.set_throttled_periods(parts[1].parse::<u64>().unwrap());
+                            }
+                            "throttled_usec" => {
+                                throttle.set_throttled_time(parts[1].parse::<u64>().unwrap());
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut cpu_stats = CPUStat::new();
+                    cpu_stats.set_throttling(throttle);
+                    cpu_stats.set_usage(cpu_usage);
+                    metrics.set_cpu(cpu_stats);
+                }
+                Subsystem::Mem(mem_ctr) => {
+                    let mem = mem_ctr.memory_stat();
+                    let mut mem_entry = MemoryEntry::new();
+                    mem_entry.set_usage(mem.usage_in_bytes);
+                    let mut mem_stat = MemoryStat::new();
+                    mem_stat.set_usage(mem_entry);
+                    mem_stat.set_total_inactive_file(mem.stat.total_inactive_file);
+                    metrics.set_memory(mem_stat);
+                }
+                Subsystem::Pid(pid_ctr) => {
+                    // ignore cgroup NotFound error
+                    let ignore_err = |cr: CgResult<u64>| -> CgResult<u64> {
+                        cr.or_else(|e| {
+                            if e.source()
+                                .and_then(<dyn StdError>::downcast_ref::<std::io::Error>)
+                                .map(std::io::Error::kind)
+                                == Some(std::io::ErrorKind::NotFound)
+                            {
+                                Ok(0)
+                            } else {
+                                Err(e)
+                            }
+                        })
+                    };
+
+                    let mut pid_stats = PidsStat::new();
+                    pid_stats.set_current(
+                        ignore_err(pid_ctr.get_pid_current())
+                            .map_err(other_error!("get current pid"))?,
+                    );
+
+                    pid_stats.set_limit(
+                        ignore_err(pid_ctr.get_pid_max().map(|val| match val {
+                            // See https://github.com/opencontainers/runc/blob/dbe8434359ca35af1c1e10df42b1f4391c1e1010/libcontainer/cgroups/fs/pids.go#L55
+                            MaxValue::Max => 0,
+                            MaxValue::Value(val) => val as u64,
+                        }))
+                        .map_err(other_error!("get pid limit"))?,
+                    );
+                    metrics.set_pids(pid_stats)
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(metrics)
+}
+
+/// Collect process cgroup stats for cgroup v2, return only necessary parts of it
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
+fn collect_metrics_v2(cgroup: &Cgroup, metrics: &mut Metrics) -> Result<()> {
+    // to make it easy, fill the necessary metrics only for v2.
     for sub_system in Cgroup::subsystems(cgroup) {
         match sub_system {
             Subsystem::Cpu(cpu_ctr) => {
+                // In cgroup v2, we need to read the cpu.stat file
                 let mut cpu_usage = CPUUsage::new();
                 let mut throttle = Throttle::new();
-                let stat = cpu_ctr.cpu().stat;
-                for line in stat.lines() {
-                    let parts = line.split(' ').collect::<Vec<&str>>();
-                    if parts.len() != 2 {
-                        Err(Error::Other(format!("invalid cpu stat line: {}", line)))?;
-                    }
-
-                    // https://github.com/opencontainers/runc/blob/dbe8434359ca35af1c1e10df42b1f4391c1e1010/libcontainer/cgroups/fs2/cpu.go#L70
-                    match parts[0] {
-                        "usage_usec" => {
-                            cpu_usage.set_total(parts[1].parse::<u64>().unwrap());
+                
+                // Access the raw stat content for v2
+                if let Some(stat_content) = &cpu_ctr.cpu().stat {
+                    for line in stat_content.lines() {
+                        let parts = line.split_whitespace().collect::<Vec<&str>>();
+                        if parts.len() >= 2 {
+                            match parts[0] {
+                                "usage_usec" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        cpu_usage.set_total(value);
+                                    }
+                                }
+                                "user_usec" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        cpu_usage.set_user(value);
+                                    }
+                                }
+                                "system_usec" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        cpu_usage.set_kernel(value);
+                                    }
+                                }
+                                "nr_periods" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        throttle.set_periods(value);
+                                    }
+                                }
+                                "nr_throttled" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        throttle.set_throttled_periods(value);
+                                    }
+                                }
+                                "throttled_usec" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        throttle.set_throttled_time(value);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
-                        "user_usec" => {
-                            cpu_usage.set_user(parts[1].parse::<u64>().unwrap());
-                        }
-                        "system_usec" => {
-                            cpu_usage.set_kernel(parts[1].parse::<u64>().unwrap());
-                        }
-                        "nr_periods" => {
-                            throttle.set_periods(parts[1].parse::<u64>().unwrap());
-                        }
-                        "nr_throttled" => {
-                            throttle.set_throttled_periods(parts[1].parse::<u64>().unwrap());
-                        }
-                        "throttled_usec" => {
-                            throttle.set_throttled_time(parts[1].parse::<u64>().unwrap());
-                        }
-                        _ => {}
                     }
                 }
+                
                 let mut cpu_stats = CPUStat::new();
                 cpu_stats.set_throttling(throttle);
                 cpu_stats.set_usage(cpu_usage);
                 metrics.set_cpu(cpu_stats);
             }
             Subsystem::Mem(mem_ctr) => {
-                let mem = mem_ctr.memory_stat();
+                // For cgroup v2, we read memory stats differently
                 let mut mem_entry = MemoryEntry::new();
-                mem_entry.set_usage(mem.usage_in_bytes);
                 let mut mem_stat = MemoryStat::new();
+                
+                // Access memory statistics for v2
+                let memory_data = mem_ctr.memory();
+                
+                // Get usage and limit from memory controller
+                if let Some(stat_content) = &memory_data.stat {
+                    for line in stat_content.lines() {
+                        let parts = line.split_whitespace().collect::<Vec<&str>>();
+                        if parts.len() >= 2 {
+                            match parts[0] {
+                                "usage" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_entry.set_usage(value);
+                                    }
+                                }
+                                "usage_limit" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_entry.set_limit(value);
+                                    }
+                                }
+                                "anon" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_anon(value);
+                                    }
+                                }
+                                "file" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_file(value);
+                                    }
+                                }
+                                "kernel_stack" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_kernel_stack(value);
+                                    }
+                                }
+                                "slab" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_slab(value);
+                                    }
+                                }
+                                "sock" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_sock(value);
+                                    }
+                                }
+                                "shmem" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_shmem(value);
+                                    }
+                                }
+                                "file_mapped" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_file_mapped(value);
+                                    }
+                                }
+                                "file_dirty" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_file_dirty(value);
+                                    }
+                                }
+                                "file_writeback" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_file_writeback(value);
+                                    }
+                                }
+                                "inactive_anon" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_inactive_anon(value);
+                                    }
+                                }
+                                "active_anon" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_active_anon(value);
+                                    }
+                                }
+                                "inactive_file" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_inactive_file(value);
+                                    }
+                                }
+                                "active_file" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_active_file(value);
+                                    }
+                                }
+                                "unevictable" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_unevictable(value);
+                                    }
+                                }
+                                "pgfault" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgfault(value);
+                                    }
+                                }
+                                "pgmajfault" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgmajfault(value);
+                                    }
+                                }
+                                "workingset_refault" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_workingset_refault(value);
+                                    }
+                                }
+                                "workingset_activate" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_workingset_activate(value);
+                                    }
+                                }
+                                "workingset_nodereclaim" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_workingset_nodereclaim(value);
+                                    }
+                                }
+                                "pgrefill" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgrefill(value);
+                                    }
+                                }
+                                "pgscan" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgscan(value);
+                                    }
+                                }
+                                "pgsteal" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgsteal(value);
+                                    }
+                                }
+                                "pgactivate" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgactivate(value);
+                                    }
+                                }
+                                "pgdeactivate" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pgdeactivate(value);
+                                    }
+                                }
+                                "pglazyfree" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pglazyfree(value);
+                                    }
+                                }
+                                "pglazyfreed" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_pglazyfreed(value);
+                                    }
+                                }
+                                "thp_fault_alloc" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_thp_fault_alloc(value);
+                                    }
+                                }
+                                "thp_collapse_alloc" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_thp_collapse_alloc(value);
+                                    }
+                                }
+                                "swap_usage" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_swap_usage(value);
+                                    }
+                                }
+                                "swap_limit" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_stat.set_swap_limit(value);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                
                 mem_stat.set_usage(mem_entry);
-                mem_stat.set_total_inactive_file(mem.stat.total_inactive_file);
                 metrics.set_memory(mem_stat);
+                
+                // Read memory.events for v2
+                if let Some(events_content) = &memory_data.events {
+                    let mut mem_events = MemoryEvents::new();
+                    for line in events_content.lines() {
+                        let parts = line.split_whitespace().collect::<Vec<&str>>();
+                        if parts.len() >= 2 {
+                            match parts[0] {
+                                "low" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_events.set_low(value);
+                                    }
+                                }
+                                "high" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_events.set_high(value);
+                                    }
+                                }
+                                "max" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_events.set_max(value);
+                                    }
+                                }
+                                "oom" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_events.set_oom(value);
+                                    }
+                                }
+                                "oom_kill" => {
+                                    if let Ok(value) = parts[1].parse::<u64>() {
+                                        mem_events.set_oom_kill(value);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    metrics.set_memory_events(mem_events);
+                }
             }
             Subsystem::Pid(pid_ctr) => {
                 // ignore cgroup NotFound error
@@ -180,13 +509,13 @@ pub fn collect_metrics(cgroup: &Cgroup) -> Result<Metrics> {
 
                 let mut pid_stats = PidsStat::new();
                 pid_stats.set_current(
-                    ignore_err(pid_ctr.get_pid_current())
+                    ignore_err(pid_ctr.current_pid())
                         .map_err(other_error!("get current pid"))?,
                 );
 
                 pid_stats.set_limit(
-                    ignore_err(pid_ctr.get_pid_max().map(|val| match val {
-                        // See https://github.com/opencontainers/runc/blob/dbe8434359ca35af1c1e10df42b1f4391c1e1010/libcontainer/cgroups/fs/pids.go#L55
+                    ignore_err(pid_ctr.max_pid().map(|val| match val {
+                        // Map cgroups-rs max value to 0 (similar to v1)
                         MaxValue::Max => 0,
                         MaxValue::Value(val) => val as u64,
                     }))
@@ -194,10 +523,92 @@ pub fn collect_metrics(cgroup: &Cgroup) -> Result<Metrics> {
                 );
                 metrics.set_pids(pid_stats)
             }
+            Subsystem::Io(io_ctr) => {
+                // Handle I/O stats for cgroup v2
+                let mut io_stats = IOStat::new();
+                let mut io_entries = Vec::new();
+                
+                // Read io.stat file content
+                if let Some(io_stat_content) = io_ctr.io().stat.as_ref() {
+                    for line in io_stat_content.lines() {
+                        let parts = line.split_whitespace().collect::<Vec<&str>>();
+                        if parts.len() >= 2 {
+                            // Extract major:minor from the beginning of the line
+                            let dev_parts: Vec<&str> = parts[0].split(':').collect();
+                            if dev_parts.len() == 2 {
+                                if let (Ok(major), Ok(minor)) = (dev_parts[0].parse::<u64>(), dev_parts[1].parse::<u64>()) {
+                                    let mut io_entry = IOEntry::new();
+                                    io_entry.set_major(major);
+                                    io_entry.set_minor(minor);
+                                    
+                                    // Process the rest of the fields (rbytes, wbytes, rios, wios, etc.)
+                                    for field in &parts[1..] {
+                                        let field_parts: Vec<&str> = field.split('=').collect();
+                                        if field_parts.len() == 2 {
+                                            match field_parts[0] {
+                                                "rbytes" => {
+                                                    if let Ok(value) = field_parts[1].parse::<u64>() {
+                                                        io_entry.set_rbytes(value);
+                                                    }
+                                                }
+                                                "wbytes" => {
+                                                    if let Ok(value) = field_parts[1].parse::<u64>() {
+                                                        io_entry.set_wbytes(value);
+                                                    }
+                                                }
+                                                "rios" => {
+                                                    if let Ok(value) = field_parts[1].parse::<u64>() {
+                                                        io_entry.set_rios(value);
+                                                    }
+                                                }
+                                                "wios" => {
+                                                    if let Ok(value) = field_parts[1].parse::<u64>() {
+                                                        io_entry.set_wios(value);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    io_entries.push(io_entry);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                io_stats.set_usage(io_entries.into());
+                metrics.set_io(io_stats);
+            }
+            Subsystem::HugeTlb(ht_ctr) => {
+                // Handle HugeTLB stats for cgroup v2
+                let mut huge_tbl_stats = Vec::new();
+                
+                // Get all supported page sizes for hugeTLB
+                // In v2, we need to iterate through different page sizes
+                // This is a simplified approach - in practice, we'd need to enumerate all page sizes
+                for page_size in ["1GB", "2MB", "16KB"] {
+                    if let Ok(current_val) = ht_ctr.current(page_size) {
+                        let mut huge_tbl_stat = HugeTlbStat::new();
+                        huge_tbl_stat.set_current(current_val);
+                        
+                        if let Ok(max_val) = ht_ctr.max(page_size) {
+                            huge_tbl_stat.set_max(max_val);
+                        }
+                        
+                        huge_tbl_stat.set_pagesize(page_size.to_string());
+                        huge_tbl_stats.push(huge_tbl_stat);
+                    }
+                }
+                
+                if !huge_tbl_stats.is_empty() {
+                    metrics.set_hugetlb(huge_tbl_stats.into());
+                }
+            }
             _ => {}
         }
     }
-    Ok(metrics)
+    Ok(())
 }
 
 // get_cgroup will return either cgroup v1 or v2 depending on system configuration
