@@ -466,7 +466,7 @@ pub fn mount_rootfs(
     let s = monitor_subscribe(Topic::All)?;
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {
-            let code: MountExitCode = wait_pid(i32::from(child), s).into();
+            let code: MountExitCode = wait_pid(i32::from(child), s)?.into();
             code.into()
         }
         Ok(ForkResult::Child) => {
