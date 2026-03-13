@@ -16,10 +16,7 @@
 
 use std::{
     convert::TryFrom,
-    os::{
-        fd::AsRawFd,
-        unix::prelude::ExitStatusExt,
-    },
+    os::{fd::AsRawFd, unix::prelude::ExitStatusExt},
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
@@ -431,7 +428,8 @@ async fn copy_console(
 ) -> Result<Console> {
     debug!("copy_console: waiting for runtime to send console fd");
     let stream = console_socket.accept().await?;
-    let f = asyncify(move || -> Result<std::fs::File> { receive_socket(stream.as_raw_fd()) }).await?;
+    let f =
+        asyncify(move || -> Result<std::fs::File> { receive_socket(stream.as_raw_fd()) }).await?;
     let f = File::from_std(f);
     if !stdio.stdin.is_empty() {
         debug!("copy_console: pipe stdin to console");
@@ -621,7 +619,12 @@ async fn copy_io_or_console<P>(
 
 #[async_trait]
 impl Spawner for ShimExecutor {
-    async fn execute(&self, cmd: Command, after_start: Box<dyn Fn()+Send>, wait_output: bool) -> runc::Result<(ExitStatus, u32, String, String)> {
+    async fn execute(
+        &self,
+        cmd: Command,
+        after_start: Box<dyn Fn() + Send>,
+        wait_output: bool,
+    ) -> runc::Result<(ExitStatus, u32, String, String)> {
         let mut cmd = cmd;
         let subscription = monitor_subscribe(Topic::Pid)
             .await
@@ -636,15 +639,20 @@ impl Spawner for ShimExecutor {
         };
         after_start();
         let pid = child.id().unwrap();
-        let (stdout, stderr, exit_code) = if wait_output {
+        let (stdout, stderr, exit_result) = if wait_output {
             tokio::join!(
-            read_std(child.stdout),
-            read_std(child.stderr),
-            wait_pid(pid as i32, subscription)
-        )
-        }  else  {
-            ("".to_string(), "".to_string(), wait_pid(pid as i32, subscription).await)
+                read_std(child.stdout),
+                read_std(child.stderr),
+                wait_pid(pid as i32, subscription)
+            )
+        } else {
+            (
+                "".to_string(),
+                "".to_string(),
+                wait_pid(pid as i32, subscription).await,
+            )
         };
+        let exit_code = exit_result.map_err(|e| runc::error::Error::Other(Box::new(e)))?;
         let status = ExitStatus::from_raw(exit_code);
         monitor_unsubscribe(sid).await.unwrap_or_default();
         Ok((status, pid, stdout, stderr))
@@ -667,17 +675,25 @@ where
     "".to_string()
 }
 
-async fn wait_pid(pid: i32, s: Subscription) -> i32 {
+async fn wait_pid(pid: i32, s: Subscription) -> containerd_shim::Result<i32> {
     let mut s = s;
     loop {
-        if let Some(ExitEvent {
-            subject: Subject::Pid(epid),
-            exit_code: code,
-        }) = s.rx.recv().await
-        {
-            if pid == epid {
-                monitor_unsubscribe(s.id).await.unwrap_or_default();
-                return code;
+        match s.rx.recv().await {
+            Some(ExitEvent {
+                subject: Subject::Pid(epid),
+                exit_code: code,
+            }) => {
+                if pid == epid {
+                    monitor_unsubscribe(s.id).await.unwrap_or_default();
+                    return Ok(code);
+                }
+            }
+            Some(_) => continue,
+            None => {
+                return Err(containerd_shim::Error::Other(format!(
+                    "monitor disconnected while waiting for {}",
+                    pid
+                )))
             }
         }
     }
