@@ -1,14 +1,9 @@
 [package]
 name = "containerd-runc-shim"
 version = "0.1.1"
-authors = [
-    "Shaobao Feng <fshb1988@gmail.com>",
-    "Tianyang Zhang <burning9699@gmail.com>",
-    "The containerd Authors",
-]
-description = "Rust implementation of containerd's runc v2 shim runtime"
+authors = ["Shaobao Feng <fshb1988@gmail.com>", "Tianyang Zhang <burning9699@gmail.com>", "The containerd Authors"]
 keywords = ["containerd", "shim", "containers"]
-categories = ["api-bindings", "asynchronous"]
+description = "Rust implementation of containerd's runc v2 shim runtime"
 
 edition.workspace = true
 license.workspace = true
@@ -24,27 +19,24 @@ name = "containerd-shim-runc-v2-rs"
 path = "src/main.rs"
 doc = false
 
+[features]
+async = ["containerd-shim/async", "runc/async", "tokio", "futures", "async-trait"]
+sandbox = ["containerd-shim/sandbox"]
+
 [dependencies]
-containerd-shim = { path = "../shim", version = "0.10.0", features = ["async"] }
-libc.workspace = true
-log.workspace = true
-nix = { workspace = true, features = ["socket", "uio", "term"] }
-oci-spec.workspace = true
-prctl.workspace = true
-runc = { path = "../runc", version = "0.3.0", features = ["async"] }
-serde.workspace = true
-serde_json.workspace = true
-time.workspace = true
-uuid.workspace = true
+log = "0.4"
+nix = { version = "0.28.0", features = ["term"] }
+libc = "0.2.95"
+time = { version = "0.3.7", features = ["serde", "std"] }
+serde = { version = "1.0.133", features = ["derive"] }
+serde_json = "1.0.74"
+oci-spec = "0.5.4"
+crossbeam = "0.8.1"
+
 # Async dependencies
-async-trait.workspace = true
-tokio = { workspace = true, features = ["full"] }
-rustix = { version = "1", features = ["termios"] }
+async-trait = { version = "0.1.51", optional = true }
+tokio = { version = "1.17.0", features = ["full"], optional = true }
+futures = { version = "0.3.21", optional = true }
 
-[package.metadata.cargo-machete]
-ignored = ["libc"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-cgroups-rs.workspace = true
-nix = { workspace = true, features = ["event"] }
-tokio-eventfd = "0.2.1"
+containerd-shim = { path = "../shim", version = "0.3.0" }
+runc = { path = "../runc", version = "0.2.0" }

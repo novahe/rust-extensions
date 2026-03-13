@@ -24,9 +24,9 @@ const PROTO_FILES: &[&str] = &[
 const FIXUP_MODULES: &[&str] = &["containerd.services.snapshots.v1"];
 
 fn main() {
-    tonic_prost_build::configure()
+    tonic_build::configure()
         .build_server(true)
-        .compile_protos(PROTO_FILES, &["vendor/"])
+        .compile(PROTO_FILES, &["vendor/"])
         .expect("Failed to generate GRPC bindings");
 
     for module in FIXUP_MODULES {
@@ -49,16 +49,8 @@ fn fixup_imports(path: &str) -> Result<(), io::Error> {
     let out_dir = env::var("OUT_DIR").unwrap();
     let path = format!("{}/{}.rs", out_dir, path);
 
-    let contents = fs::read_to_string(&path)?
-        .replace("super::super::super::types", "crate::api::types")
-        .replace(
-            "/// 	filters\\[0\\] or filters\\[1\\] or ... or filters\\[n-1\\] or filters\\[n\\]",
-            r#"
-            /// ```notrust
-            /// 	filters[0] or filters[1] or ... or filters[n-1] or filters[n]
-            /// ```"#,
-        );
-
+    let contents =
+        fs::read_to_string(&path)?.replace("super::super::super::types", "crate::api::types");
     fs::write(path, contents)?;
     Ok(())
 }

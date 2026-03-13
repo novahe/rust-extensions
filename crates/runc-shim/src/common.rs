@@ -15,21 +15,17 @@
 */
 
 use std::{
-    env,
-    future::Future,
+    fs::File,
     io::IoSliceMut,
     ops::Deref,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::io::RawFd,
-    },
+    os::{fd::FromRawFd, unix::io::RawFd},
     path::Path,
     sync::Arc,
-    time::Duration,
 };
 
 use containerd_shim::{
     api::{ExecProcessRequest, Options},
+    io::Stdio,
     io_error, other, other_error,
     util::IntoOption,
     Error,
@@ -48,29 +44,15 @@ use runc::{
     options::GlobalOpts,
     Runc, Spawner,
 };
-use serde::Deserialize;
-
-use super::io::Stdio;
 
 pub const GROUP_LABELS: [&str; 2] = [
     "io.containerd.runc.v2.group",
     "io.kubernetes.cri.sandbox-id",
 ];
 pub const INIT_PID_FILE: &str = "init.pid";
-pub const LOG_JSON_FILE: &str = "log.json";
-pub const FIFO_SCHEME: &str = "fifo";
 
-const TIMEOUT_DURATION: std::time::Duration = Duration::from_secs(3);
-
-#[derive(Deserialize)]
-pub struct Log {
-    pub level: String,
-    pub msg: String,
-}
-
-#[derive(Default)]
 pub struct ProcessIO {
-    pub uri: Option<String>,
+    pub _uri: Option<String>,
     pub io: Option<Arc<dyn Io>>,
     pub copy: bool,
 }
@@ -81,25 +63,36 @@ pub fn create_io(
     _io_gid: u32,
     stdio: &Stdio,
 ) -> containerd_shim::Result<ProcessIO> {
-    let mut pio = ProcessIO::default();
     if stdio.is_null() {
         let nio = NullIo::new().map_err(io_error!(e, "new Null Io"))?;
-        pio.io = Some(Arc::new(nio));
+        let pio = ProcessIO {
+            _uri: None,
+            io: Some(Arc::new(nio)),
+            copy: false,
+        };
         return Ok(pio);
     }
     let stdout = stdio.stdout.as_str();
     let scheme_path = stdout.trim().split("://").collect::<Vec<&str>>();
     let scheme: &str;
+    let uri: String;
     if scheme_path.len() <= 1 {
-        // no scheme specified, default schema to fifo
-        scheme = FIFO_SCHEME;
-        pio.uri = Some(format!("{}://{}", scheme, stdout));
+        // no scheme specified
+        // default schema to fifo
+        uri = format!("fifo://{}", stdout);
+        scheme = "fifo"
     } else {
+        uri = stdout.to_string();
         scheme = scheme_path[0];
-        pio.uri = Some(stdout.to_string());
     }
 
-    if scheme == FIFO_SCHEME {
+    let mut pio = ProcessIO {
+        _uri: Some(uri),
+        io: None,
+        copy: false,
+    };
+
+    if scheme == "fifo" {
         debug!(
             "create named pipe io for container {}, stdin: {}, stdout: {}, stderr: {}",
             id,
@@ -170,7 +163,7 @@ pub fn create_runc(
     })
     .join(namespace);
 
-    let log = bundle.as_ref().join(LOG_JSON_FILE);
+    let log = bundle.as_ref().join("log.json");
     let mut gopts = GlobalOpts::default()
         .command(runtime)
         .root(root)
@@ -182,21 +175,21 @@ pub fn create_runc(
     }
     gopts
         .build()
-        .map_err(other_error!("unable to create runc instance"))
+        .map_err(other_error!(e, "unable to create runc instance"))
 }
 
 #[derive(Default)]
 pub(crate) struct CreateConfig {}
 
-pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<OwnedFd> {
+pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<File> {
     let mut buf = [0u8; 4096];
     let mut iovec = [IoSliceMut::new(&mut buf)];
     let mut space = cmsg_space!([RawFd; 2]);
     let (path, fds) =
         match recvmsg::<UnixAddr>(stream_fd, &mut iovec, Some(&mut space), MsgFlags::empty()) {
             Ok(msg) => {
-                let iter = msg.cmsgs();
-                if let Some(ControlMessageOwned::ScmRights(fds)) = iter?.next() {
+                let mut iter = msg.cmsgs();
+                if let Some(ControlMessageOwned::ScmRights(fds)) = iter.next() {
                     (iovec[0].deref(), fds)
                 } else {
                     return Err(other!("received message is empty"));
@@ -213,17 +206,14 @@ pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<OwnedFd> {
         warn!("failed to get path from array {}", e);
         "".to_string()
     });
-
-    let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-
     let path = path.trim_matches(char::from(0));
     debug!(
         "copy_console: console socket get path: {}, fd: {}",
-        path,
-        fd.as_raw_fd(),
+        path, &fds[0]
     );
-    tcgetattr(&fd)?;
-    Ok(fd)
+    let f = unsafe { File::from_raw_fd(fds[0]) };
+    tcgetattr(&f)?;
+    Ok(f)
 }
 
 pub fn has_shared_pid_namespace(spec: &Spec) -> bool {
@@ -240,26 +230,5 @@ pub fn has_shared_pid_namespace(spec: &Spec) -> bool {
                 true
             }
         },
-    }
-}
-
-/// Returns a temp dir. If the environment variable "XDG_RUNTIME_DIR" is set, return its value.
-/// Otherwise if `std::env::temp_dir()` failed, return current dir or return the temp dir depended on OS.
-pub(crate) fn xdg_runtime_dir() -> String {
-    env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| env::temp_dir().to_str().unwrap_or(".").to_string())
-}
-
-pub async fn handle_file_open<F, Fut>(file_op: F) -> Result<tokio::fs::File, tokio::io::Error>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<tokio::fs::File, tokio::io::Error>> + Send,
-{
-    match tokio::time::timeout(TIMEOUT_DURATION, file_op()).await {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "File operation timed out",
-        )),
     }
 }

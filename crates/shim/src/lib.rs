@@ -14,48 +14,53 @@
    limitations under the License.
 */
 
-#![cfg_attr(feature = "docs", doc = include_str!("../README.md"))]
+//! A library to implement custom runtime v2 shims for containerd.
+//!
+//! # Runtime
+//! Runtime v2 introduces a first class shim API for runtime authors to integrate with containerd.
+//! The shim API is minimal and scoped to the execution lifecycle of a container.
+//!
+//! This crate simplifies shim v2 runtime development for containerd. It handles common tasks such
+//! as command line parsing, setting up shim's TTRPC server, logging, events, etc.
+//!
+//! Clients are expected to implement [Shim] and [Task] traits with task handling routines.
+//! This generally replicates same API as in Go [version](https://github.com/containerd/containerd/blob/main/runtime/v2/example/cmd/main.go).
+//!
+//! Once implemented, shim's bootstrap code is as easy as:
+//! ```text
+//! shim::run::<Service>("io.containerd.empty.v1")
+//! ```
+//!
 
-use std::{fs::File, path::PathBuf};
-#[cfg(windows)]
-use std::{fs::OpenOptions, os::windows::prelude::OpenOptionsExt};
-#[cfg(unix)]
-use std::{os::unix::net::UnixListener, path::Path};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs::File,
+    hash::Hasher,
+    os::unix::{io::RawFd, net::UnixListener},
+    path::{Path, PathBuf},
+};
 
 pub use containerd_shim_protos as protos;
+use nix::ioctl_write_ptr_bad;
 pub use protos::{
     shim::shim::DeleteResponse,
     ttrpc::{context::Context, Result as TtrpcResult},
 };
-use sha2::{Digest, Sha256};
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
-#[cfg(feature = "async")]
-pub use crate::asynchronous::*;
 pub use crate::error::{Error, Result};
-#[cfg(not(feature = "async"))]
-pub use crate::synchronous::*;
 
 #[macro_use]
 pub mod error;
 
 mod args;
-pub use args::{parse, Flags};
 #[cfg(feature = "async")]
 pub mod asynchronous;
 pub mod cgroup;
 pub mod event;
-pub mod logger;
+pub mod io;
+mod logger;
 pub mod monitor;
-#[cfg(target_os = "linux")]
-pub mod mount_linux;
-#[cfg(not(target_os = "linux"))]
-pub mod mount_other;
-#[cfg(target_os = "linux")]
-pub use mount_linux as mount;
-#[cfg(not(target_os = "linux"))]
-pub use mount_other as mount;
+pub mod mount;
 mod reap;
 #[cfg(not(feature = "async"))]
 pub mod synchronous;
@@ -91,41 +96,37 @@ macro_rules! cfg_async {
 }
 
 cfg_not_async! {
+    pub use crate::synchronous::*;
+    pub use crate::synchronous::console;
     pub use crate::synchronous::publisher;
     pub use protos::shim::shim_ttrpc::Task;
     pub use protos::ttrpc::TtrpcContext;
 }
 
 cfg_async! {
+    pub use crate::asynchronous::*;
+    pub use crate::asynchronous::console;
+    pub use crate::asynchronous::container;
+    pub use crate::asynchronous::processes;
+    pub use crate::asynchronous::task;
     pub use crate::asynchronous::publisher;
     pub use protos::shim_async::Task;
     pub use protos::ttrpc::r#async::TtrpcContext;
 }
 
+ioctl_write_ptr_bad!(ioctl_set_winsz, libc::TIOCSWINSZ, libc::winsize);
+
 const TTRPC_ADDRESS: &str = "TTRPC_ADDRESS";
 
 /// Config of shim binary options provided by shim implementations
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Config {
     /// Disables automatic configuration of logrus to use the shim FIFO
     pub no_setup_logger: bool,
-    // Sets the the default log level. Default is info
-    pub default_log_level: String,
     /// Disables the shim binary from reaping any child process implicitly
     pub no_reaper: bool,
     /// Disables setting the shim as a child subreaper.
     pub no_sub_reaper: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            no_setup_logger: false,
-            default_log_level: "info".to_string(),
-            no_reaper: false,
-            no_sub_reaper: false,
-        }
-    }
 }
 
 /// Startup options received from containerd to start new shim instance.
@@ -147,38 +148,34 @@ pub struct StartOpts {
     pub debug: bool,
 }
 
+/// The shim process communicates with the containerd server through a communication channel
+/// created by containerd. One endpoint of the communication channel is passed to shim process
+/// through a file descriptor during forking, which is the fourth(3) file descriptor.
+const SOCKET_FD: RawFd = 3;
+
 #[cfg(target_os = "linux")]
 pub const SOCKET_ROOT: &str = "/run/containerd";
 
 #[cfg(target_os = "macos")]
 pub const SOCKET_ROOT: &str = "/var/run/containerd";
 
-#[cfg(target_os = "windows")]
-pub const SOCKET_ROOT: &str = r"\\.\pipe\containerd-containerd";
-
 /// Make socket path from containerd socket path, namespace and id.
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "Info"))]
 pub fn socket_address(socket_path: &str, namespace: &str, id: &str) -> String {
     let path = PathBuf::from(socket_path)
         .join(namespace)
         .join(id)
         .display()
         .to_string();
+
     let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(path);
-        hasher.finalize()
+        let mut hasher = DefaultHasher::new();
+        hasher.write(path.as_bytes());
+        hasher.finish()
     };
-    if cfg!(unix) {
-        format!("unix://{}/s/{:x}", SOCKET_ROOT, hash)
-    } else if cfg!(windows) {
-        format!(r"\\.\pipe\containerd-shim-{:x}-pipe", hash)
-    } else {
-        panic!("unsupported platform")
-    }
+
+    format!("unix://{}/{:x}.sock", SOCKET_ROOT, hash)
 }
 
-#[cfg(unix)]
 fn parse_sockaddr(addr: &str) -> &str {
     if let Some(addr) = addr.strip_prefix("unix://") {
         return addr;
@@ -191,26 +188,6 @@ fn parse_sockaddr(addr: &str) -> &str {
     addr
 }
 
-#[cfg(windows)]
-fn start_listener(address: &str) -> std::io::Result<()> {
-    let mut opts = OpenOptions::new();
-    opts.read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_OVERLAPPED);
-    if let Ok(f) = opts.open(address) {
-        info!("found existing named pipe: {}", address);
-        drop(f);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "address already exists",
-        ));
-    }
-
-    // windows starts the listener on the second invocation of the shim
-    Ok(())
-}
-
-#[cfg(unix)]
 fn start_listener(address: &str) -> std::io::Result<UnixListener> {
     let path = parse_sockaddr(address);
     // Try to create the needed directory hierarchy.
@@ -229,7 +206,6 @@ mod tests {
     use crate::start_listener;
 
     #[test]
-    #[cfg(unix)]
     fn test_start_listener() {
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().to_str().unwrap().to_owned();
@@ -251,17 +227,5 @@ mod tests {
         assert!(start_listener(&txt_file).is_err());
         let context = std::fs::read_to_string(&txt_file).unwrap();
         assert_eq!(context, "test");
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_start_listener_windows() {
-        use mio::windows::NamedPipe;
-
-        let named_pipe = "\\\\.\\pipe\\test-pipe-duplicate".to_string();
-
-        start_listener(&named_pipe).unwrap();
-        let _pipe_server = NamedPipe::new(named_pipe.clone()).unwrap();
-        start_listener(&named_pipe).expect_err("address already exists");
     }
 }

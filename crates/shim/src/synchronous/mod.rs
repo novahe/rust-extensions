@@ -32,38 +32,33 @@
 //! ```
 //!
 
-macro_rules! cfg_unix {
-    ($($item:item)*) => {
-        $(
-            #[cfg(unix)]
-            $item
-        )*
-    }
-}
-
-macro_rules! cfg_windows {
-    ($($item:item)*) => {
-        $(
-            #[cfg(windows)]
-            $item
-        )*
-    }
-}
-
 use std::{
-    env,
+    convert::TryFrom,
+    env, fs,
     io::Write,
+    os::unix::{fs::FileTypeExt, io::AsRawFd},
+    path::Path,
     process::{self, Command, Stdio},
     sync::{Arc, Condvar, Mutex},
 };
 
+use command_fds::{CommandFdExt, FdMapping};
+use libc::{SIGCHLD, SIGINT, SIGPIPE, SIGTERM};
 pub use log::{debug, error, info, warn};
+use nix::{
+    errno::Errno,
+    sys::{
+        signal::Signal,
+        wait::{self, WaitPidFlag, WaitStatus},
+    },
+    unistd::Pid,
+};
+use signal_hook::iterator::Signals;
 use util::{read_address, write_address};
 
 use crate::{
     api::DeleteResponse,
-    args::{self, Flags},
-    logger,
+    args, logger, parse_sockaddr,
     protos::{
         protobuf::Message,
         shim::shim_ttrpc::{create_task, Task},
@@ -71,48 +66,14 @@ use crate::{
     },
     reap, socket_address, start_listener,
     synchronous::publisher::RemotePublisher,
-    Config, Error, Result, StartOpts, TTRPC_ADDRESS,
+    Config, Error, Result, StartOpts, SOCKET_FD, TTRPC_ADDRESS,
 };
-
-cfg_unix! {
-    use crate::parse_sockaddr;
-    use libc::{SIGCHLD, SIGINT, SIGPIPE, SIGTERM};
-    use nix::{
-        errno::Errno,
-        sys::{
-            signal::Signal,
-            wait::{self, WaitPidFlag, WaitStatus},
-        },
-        unistd::Pid,
-    };
-    use signal_hook::iterator::Signals;
-    use std::os::unix::fs::FileTypeExt;
-    use std::{convert::TryFrom, fs, path::Path};
-}
-
-cfg_windows! {
-    use std::{
-        io, ptr,
-        fs::OpenOptions,
-        os::windows::prelude::{AsRawHandle, OpenOptionsExt},
-    };
-
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::{
-            Console::SetConsoleCtrlHandler,
-            Threading::{CreateSemaphoreA, ReleaseSemaphore, WaitForSingleObject, INFINITE},
-        },
-        Storage::FileSystem::FILE_FLAG_OVERLAPPED
-    };
-
-    static mut SEMAPHORE: HANDLE = 0 as HANDLE;
-    const MAX_SEM_COUNT: i32 = 255;
-}
 
 pub mod monitor;
 pub mod publisher;
 pub mod util;
+
+pub mod console;
 
 /// Helper structure that wraps atomic bool to signal shim server when to shutdown the TTRPC server.
 ///
@@ -120,12 +81,6 @@ pub mod util;
 #[allow(clippy::mutex_atomic)] // Condvar expected to be used with Mutex, not AtomicBool.
 #[derive(Default)]
 pub struct ExitSignal(Mutex<bool>, Condvar);
-
-// Wrapper type to help hide platform specific signal handling.
-struct AppSignals {
-    #[cfg(unix)]
-    signals: Signals,
-}
 
 #[allow(clippy::mutex_atomic)]
 impl ExitSignal {
@@ -158,9 +113,10 @@ pub trait Shim {
     ///
     /// # Arguments
     /// - `runtime_id`: identifier of the container runtime.
-    /// - `args`: command line arguments passed to the shim which includes namespace and id
+    /// - `id`: identifier of the shim/container, passed in from Containerd.
+    /// - `namespace`: namespace of the shim/container, passed in from Containerd.
     /// - `config`: for the shim to pass back configuration information
-    fn new(runtime_id: &str, args: &Flags, config: &mut Config) -> Self;
+    fn new(runtime_id: &str, id: &str, namespace: &str, config: &mut Config) -> Self;
 
     /// Start shim will be called by containerd when launching new shim instance.
     ///
@@ -181,7 +137,6 @@ pub trait Shim {
 }
 
 /// Shim entry point that must be invoked from `main`.
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 pub fn run<T>(runtime_id: &str, opts: Option<Config>)
 where
     T: Shim + Send + Sync + 'static,
@@ -192,7 +147,6 @@ where
     }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 fn bootstrap<T>(runtime_id: &str, opts: Option<Config>) -> Result<()>
 where
     T: Shim + Send + Sync + 'static,
@@ -201,25 +155,19 @@ where
     let os_args: Vec<_> = env::args_os().collect();
     let flags = args::parse(&os_args[1..])?;
 
-    if flags.namespace.is_empty() {
-        return Err(Error::InvalidArgument(String::from(
-            "Shim namespace cannot be empty",
-        )));
-    }
-
     let ttrpc_address = env::var(TTRPC_ADDRESS)?;
 
     // Create shim instance
     let mut config = opts.unwrap_or_default();
 
-    // Setup signals (On Linux need register signals before start main app according to signal_hook docs)
+    // Setup signals
     let signals = setup_signals(&config);
 
     if !config.no_sub_reaper {
         reap::set_subreaper()?;
     }
 
-    let mut shim = T::new(runtime_id, &flags, &mut config);
+    let mut shim = T::new(runtime_id, &flags.id, &flags.namespace, &mut config);
 
     match flags.action.as_str() {
         "start" => {
@@ -251,39 +199,18 @@ where
             Ok(())
         }
         _ => {
-            if flags.socket.is_empty() {
-                return Err(Error::InvalidArgument(String::from(
-                    "Shim socket cannot be empty",
-                )));
-            }
-
-            #[cfg(windows)]
-            util::setup_debugger_event();
-
             if !config.no_setup_logger {
-                logger::init(
-                    flags.debug,
-                    &config.default_log_level,
-                    &flags.namespace,
-                    &flags.id,
-                )?;
+                logger::init(flags.debug)?;
             }
 
             let publisher = publisher::RemotePublisher::new(&ttrpc_address)?;
-            let task = Box::new(shim.create_task_service(publisher))
-                as Box<dyn containerd_shim_protos::Task + Send + Sync + 'static>;
-            let task_service = create_task(Arc::from(task));
-            let Some(mut server) = create_server_with_retry(&flags)? else {
-                signal_server_started();
-                return Ok(());
-            };
-            server = server.register_service(task_service);
+            let task = shim.create_task_service(publisher);
+            let task_service = create_task(Arc::new(Box::new(task)));
+            let mut server = Server::new().register_service(task_service);
+            server = server.add_listener(SOCKET_FD)?;
             server.start()?;
 
-            signal_server_started();
-
             info!("Shim successfully started, waiting for exit signal...");
-            #[cfg(unix)]
             std::thread::spawn(move || handle_signals(signals));
             shim.wait();
 
@@ -299,145 +226,56 @@ where
     }
 }
 
-#[cfg(windows)]
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-fn create_server(flags: &args::Flags) -> Result<Server> {
-    start_listener(&flags.socket).map_err(io_error!(e, "starting listener"))?;
-    let mut server = Server::new();
-    server = server.bind(&flags.socket)?;
-    Ok(server)
-}
-
-#[cfg(unix)]
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-fn create_server(flags: &args::Flags) -> Result<Server> {
-    use std::os::fd::IntoRawFd;
-    let listener = start_listener(&flags.socket).map_err(io_error!(e, "starting listener"))?;
-    let mut server = Server::new();
-    server = server.add_listener(listener.into_raw_fd())?;
-    Ok(server)
-}
-
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-fn create_server_with_retry(flags: &args::Flags) -> Result<Option<Server>> {
-    // Really try to create a server.
-    let server = match create_server(flags) {
-        Ok(server) => server,
-        Err(Error::IoError { err, .. }) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            // If the address is already in use then make sure it is up and running and return the address
-            // This allows for running a single shim per container scenarios
-            if let Ok(()) = wait_socket_working(&flags.socket, 5, 200) {
-                write_address(&flags.socket)?;
-                return Ok(None);
-            }
-            remove_socket(&flags.socket)?;
-            create_server(flags)?
-        }
-        Err(e) => return Err(e),
-    };
-
-    Ok(Some(server))
-}
-
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-fn setup_signals(_config: &Config) -> Option<AppSignals> {
-    #[cfg(unix)]
-    {
-        let signals = Signals::new([SIGTERM, SIGINT, SIGPIPE]).expect("new signal failed");
-        if !_config.no_reaper {
-            signals.add_signal(SIGCHLD).expect("add signal failed");
-        }
-        Some(AppSignals { signals })
+fn setup_signals(config: &Config) -> Signals {
+    let signals = Signals::new([SIGTERM, SIGINT, SIGPIPE]).expect("new signal failed");
+    if !config.no_reaper {
+        signals.add_signal(SIGCHLD).expect("add signal failed");
     }
-
-    #[cfg(windows)]
-    {
-        unsafe {
-            SEMAPHORE = CreateSemaphoreA(ptr::null_mut(), 0, MAX_SEM_COUNT, ptr::null());
-            if SEMAPHORE == 0 {
-                panic!("Failed to create semaphore: {}", io::Error::last_os_error());
-            }
-
-            if SetConsoleCtrlHandler(Some(signal_handler), 1) == 0 {
-                let e = io::Error::last_os_error();
-                CloseHandle(SEMAPHORE);
-                SEMAPHORE = 0 as HANDLE;
-                panic!("Failed to set console handler: {}", e);
-            }
-        }
-        None
-    }
+    signals
 }
 
-#[cfg(windows)]
-unsafe extern "system" fn signal_handler(_: u32) -> i32 {
-    ReleaseSemaphore(SEMAPHORE, 1, ptr::null_mut());
-    1
-}
-
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-fn handle_signals(mut _signals: Option<AppSignals>) {
-    #[cfg(unix)]
-    {
-        let mut app_signals = _signals.take().unwrap();
-        loop {
-            for sig in app_signals.signals.wait() {
-                match sig {
-                    SIGTERM | SIGINT => {
-                        debug!("received {}", sig);
+fn handle_signals(mut signals: Signals) {
+    loop {
+        for sig in signals.wait() {
+            match sig {
+                SIGTERM | SIGINT => {
+                    debug!("received {}", sig);
+                }
+                SIGCHLD => loop {
+                    // Note that this thread sticks to child even it is suspended.
+                    match wait::waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::Exited(pid, status)) => {
+                            monitor::monitor_notify_by_pid(pid.as_raw(), status)
+                                .unwrap_or_else(|e| error!("failed to send exit event {}", e))
+                        }
+                        Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                            debug!("child {} terminated({})", pid, sig);
+                            let exit_code = 128 + sig as i32;
+                            monitor::monitor_notify_by_pid(pid.as_raw(), exit_code)
+                                .unwrap_or_else(|e| error!("failed to send signal event {}", e))
+                        }
+                        Err(Errno::ECHILD) | Ok(WaitStatus::StillAlive) => {
+                            break;
+                        }
+                        Err(e) => {
+                            // stick until all children will be successfully waited, even some unexpected error occurs.
+                            warn!("error occurred in signal handler: {}", e);
+                        }
+                        _ => {} // stick until exit
                     }
-                    SIGCHLD => loop {
-                        // Note that this thread sticks to child even it is suspended.
-                        match wait::waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-                            Ok(WaitStatus::Exited(pid, status)) => {
-                                monitor::monitor_notify_by_pid(pid.as_raw(), status)
-                                    .unwrap_or_else(|e| error!("failed to send exit event {}", e))
-                            }
-                            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                                debug!("child {} terminated({})", pid, sig);
-                                let exit_code = 128 + sig as i32;
-                                monitor::monitor_notify_by_pid(pid.as_raw(), exit_code)
-                                    .unwrap_or_else(|e| error!("failed to send signal event {}", e))
-                            }
-                            Ok(WaitStatus::StillAlive) => {
-                                break;
-                            }
-                            Err(Errno::ECHILD) => {
-                                break;
-                            }
-                            Err(e) => {
-                                // stick until all children will be successfully waited, even some unexpected error occurs.
-                                warn!("error occurred in signal handler: {}", e);
-                            }
-                            _ => {} // stick until exit
-                        }
-                    },
-                    _ => {
-                        if let Ok(sig) = Signal::try_from(sig) {
-                            debug!("received {}", sig);
-                        } else {
-                            warn!("received invalid signal {}", sig);
-                        }
+                },
+                _ => {
+                    if let Ok(sig) = Signal::try_from(sig) {
+                        debug!("received {}", sig);
+                    } else {
+                        warn!("received invalid signal {}", sig);
                     }
                 }
             }
         }
     }
-
-    #[cfg(windows)]
-    {
-        // must start on thread as waitforSingleObject puts the current thread to sleep
-        loop {
-            unsafe {
-                WaitForSingleObject(SEMAPHORE, INFINITE);
-                //Windows doesn't have similar signal like SIGCHLD
-                // We could implement something if required but for now
-            }
-        }
-    }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 fn wait_socket_working(address: &str, interval_in_ms: u64, count: u32) -> Result<()> {
     for _i in 0..count {
         match Client::connect(address) {
@@ -452,58 +290,58 @@ fn wait_socket_working(address: &str, interval_in_ms: u64, count: u32) -> Result
     Err(other!("time out waiting for socket {}", address))
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 fn remove_socket_silently(address: &str) {
     remove_socket(address).unwrap_or_else(|e| warn!("failed to remove file {} {:?}", address, e))
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 fn remove_socket(address: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let path = parse_sockaddr(address);
-        if let Ok(md) = Path::new(path).metadata() {
-            if md.file_type().is_socket() {
-                fs::remove_file(path).map_err(io_error!(e, "remove socket"))?;
-            }
+    let path = parse_sockaddr(address);
+    if let Ok(md) = Path::new(path).metadata() {
+        if md.file_type().is_socket() {
+            fs::remove_file(path).map_err(io_error!(e, "remove socket"))?;
         }
     }
-
-    #[cfg(windows)]
-    {
-        let mut opts = OpenOptions::new();
-        opts.read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_OVERLAPPED);
-        if let Ok(f) = opts.open(address) {
-            info!("attempting to remove existing named pipe: {}", address);
-            unsafe { CloseHandle(f.as_raw_handle() as isize) };
-        }
-    }
-
     Ok(())
 }
 
 /// Spawn is a helper func to launch shim process.
 /// Typically this expected to be called from `StartShim`.
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 pub fn spawn(opts: StartOpts, grouping: &str, vars: Vec<(&str, &str)>) -> Result<(u32, String)> {
     let cmd = env::current_exe().map_err(io_error!(e, ""))?;
     let cwd = env::current_dir().map_err(io_error!(e, ""))?;
     let address = socket_address(&opts.address, &opts.namespace, grouping);
 
-    // Activation pattern comes from the hcsshim: https://github.com/microsoft/hcsshim/blob/v0.10.0-rc.7/cmd/containerd-shim-runhcs-v1/serve.go#L57-L70
-    // another way to do it would to create named pipe and pass it to the child process through handle inheritence but that would require duplicating
-    // the logic in Rust's 'command' for process creation.  There is an  issue in Rust to make it simplier to specify handle inheritence and this could
-    // be revisited once https://github.com/rust-lang/rust/issues/54760 is implemented.
+    // Create socket and prepare listener.
+    // We'll use `add_listener` when creating TTRPC server.
+    let listener = match start_listener(&address) {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::AddrInUse {
+                return Err(Error::IoError {
+                    context: "".to_string(),
+                    err: e,
+                });
+            };
+            if let Ok(()) = wait_socket_working(&address, 5, 200) {
+                write_address(&address)?;
+                return Ok((0, address));
+            }
+            remove_socket(&address)?;
+            start_listener(&address).map_err(io_error!(e, ""))?
+        }
+    };
 
     let mut command = Command::new(cmd);
+
     command
         .current_dir(cwd)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .envs(vars)
+        .fd_mappings(vec![FdMapping {
+            parent_fd: listener.as_raw_fd(),
+            child_fd: SOCKET_FD,
+        }])?
         .args([
             "-namespace",
             &opts.namespace,
@@ -511,77 +349,20 @@ pub fn spawn(opts: StartOpts, grouping: &str, vars: Vec<(&str, &str)>) -> Result
             &opts.id,
             "-address",
             &opts.address,
-            "-socket",
-            &address,
         ]);
-
     if opts.debug {
         command.arg("-debug");
     }
+    command.envs(vars);
 
-    // On Windows Rust currently sets the `HANDLE_FLAG_INHERIT` flag to true when using Command::spawn.
-    // When a child process is spawned by another process (containerd) the child process inherits the parent's stdin, stdout, and stderr handles.
-    // Due to the HANDLE_FLAG_INHERIT flag being set to true this will cause containerd to hand until the child process closes the handles.
-    // As a workaround we can Disables inheritance on the io pipe handles.
-    // This workaround comes from https://github.com/rust-lang/rust/issues/54760#issuecomment-1045940560
-    #[cfg(windows)]
-    disable_handle_inheritance();
-
-    let mut child = command.spawn().map_err(io_error!(e, "spawn shim"))?;
-
-    let mut reader = child.stdout.take().unwrap();
-    std::io::copy(&mut reader, &mut std::io::stderr()).unwrap();
-
-    Ok((child.id(), address))
-}
-
-#[cfg(windows)]
-fn disable_handle_inheritance() {
-    use windows_sys::Win32::{
-        Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT},
-        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
-    };
-
-    unsafe {
-        let std_err = GetStdHandle(STD_ERROR_HANDLE);
-        let std_in = GetStdHandle(STD_INPUT_HANDLE);
-        let std_out = GetStdHandle(STD_OUTPUT_HANDLE);
-
-        for handle in [std_err, std_in, std_out] {
-            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
-            //info!(" handle for... {:?}", handle);
-            //CloseHandle(handle);
-        }
-    }
-}
-
-// This closes the stdout handle which was mapped to the stderr on the first invocation of the shim.
-// This releases first process which will give containerd the address of the namedpipe.
-#[cfg(windows)]
-fn signal_server_started() {
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
-
-    unsafe {
-        let std_out = GetStdHandle(STD_OUTPUT_HANDLE);
-
-        {
-            let handle = std_out;
-            CloseHandle(handle);
-        }
-    }
-}
-
-// This closes the stdout handle which was mapped to the stderr on the first invocation of the shim.
-// This releases first process which will give containerd the address of the namedpipe.
-#[cfg(unix)]
-fn signal_server_started() {
-    use libc::{dup2, STDERR_FILENO, STDOUT_FILENO};
-
-    unsafe {
-        if dup2(STDERR_FILENO, STDOUT_FILENO) < 0 {
-            panic!("Error closing pipe: {}", std::io::Error::last_os_error())
-        }
-    }
+    command
+        .spawn()
+        .map_err(io_error!(e, "spawn shim"))
+        .map(|child| {
+            // Ownership of `listener` has been passed to child.
+            std::mem::forget(listener);
+            (child.id(), address)
+        })
 }
 
 #[cfg(test)]
@@ -604,43 +385,5 @@ mod tests {
         if let Err(err) = handle.join() {
             panic!("{:?}", err);
         }
-    }
-
-    struct Nop {}
-
-    struct NopTask {}
-    impl Task for NopTask {}
-
-    impl Shim for Nop {
-        type T = NopTask;
-
-        fn new(_runtime_id: &str, _args: &Flags, _config: &mut Config) -> Self {
-            Nop {}
-        }
-
-        fn start_shim(&mut self, _opts: StartOpts) -> Result<String> {
-            Ok("".to_string())
-        }
-
-        fn delete_shim(&mut self) -> Result<DeleteResponse> {
-            Ok(DeleteResponse::default())
-        }
-
-        fn wait(&mut self) {}
-
-        fn create_task_service(&self, _publisher: RemotePublisher) -> Self::T {
-            NopTask {}
-        }
-    }
-
-    #[test]
-    fn no_namespace() {
-        let runtime_id = "test";
-        let res = bootstrap::<Nop>(runtime_id, None);
-        assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("Shim namespace cannot be empty"));
     }
 }

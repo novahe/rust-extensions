@@ -14,24 +14,18 @@
    limitations under the License.
 */
 
-use containerd_client::Client;
+use client::services::v1::version_client::VersionClient;
+use containerd_client as client;
 
 /// Make sure you run containerd before running this example.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    #[cfg(unix)]
-    let path = "/var/run/containerd/containerd.sock";
-
-    #[cfg(windows)]
-    let path = r"\\.\pipe\containerd-containerd";
-
-    let client = Client::from_path(path).await.expect("Connect failed");
-
-    let resp = client
-        .version()
-        .version(())
+    let channel = client::connect("/run/containerd/containerd.sock")
         .await
-        .expect("Failed to query version");
+        .expect("Connect Failed");
+
+    let mut client = VersionClient::new(channel);
+    let resp = client.version(()).await.expect("Failed to query version");
 
     println!("Response: {:?}", resp.get_ref());
 }

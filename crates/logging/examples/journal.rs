@@ -23,7 +23,7 @@ fn pump(reader: fs::File) {
     io::BufReader::new(reader)
         .lines()
         .map_while(Result::ok)
-        .for_each(|_str| {
+        .for_each(|_line| {
             // Write log string to destination here.
             // For instance with journald:
             //  systemd::journal::print(0, &str);

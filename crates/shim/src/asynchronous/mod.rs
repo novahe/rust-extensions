@@ -15,28 +15,32 @@
 */
 
 use std::{
+    convert::TryFrom,
     env,
-    io::Read,
-    os::unix::{fs::FileTypeExt, net::UnixListener},
+    future::Future,
+    os::unix::{fs::FileTypeExt, io::AsRawFd, net::UnixListener},
     path::Path,
-    process::{self, Command as StdCommand, Stdio},
+    pin::Pin,
+    process,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    task::{ready, Poll},
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
+use command_fds::{CommandFdExt, FdMapping};
+#[cfg(feature = "sandbox")]
+use containerd_shim_protos::sandbox::sandbox_ttrpc::{create_sandbox, Sandbox};
 use containerd_shim_protos::{
     api::DeleteResponse,
-    protobuf::{well_known_types::any::Any, Message, MessageField},
-    shim::oci::Options,
+    protobuf::Message,
     shim_async::{create_task, Client, Task},
     ttrpc::r#async::Server,
-    types::introspection::{self, RuntimeInfo},
 };
-use futures::stream::{poll_fn, BoxStream, SelectAll, StreamExt};
+use futures::StreamExt;
 use libc::{SIGCHLD, SIGINT, SIGPIPE, SIGTERM};
 use log::{debug, error, info, warn};
 use nix::{
@@ -47,11 +51,11 @@ use nix::{
     },
     unistd::Pid,
 };
-use oci_spec::runtime::Features;
-use tokio::{io::AsyncWriteExt, process::Command, sync::Notify};
-use which::which;
-
-const DEFAULT_BINARY_NAME: &str = "runc";
+use signal_hook_tokio::Signals;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{futures::Notified, Notify},
+};
 
 use crate::{
     args,
@@ -59,11 +63,16 @@ use crate::{
     error::{Error, Result},
     logger, parse_sockaddr, reap, socket_address,
     util::{asyncify, read_file_to_str, write_str_to_file},
-    Config, Flags, StartOpts, TTRPC_ADDRESS,
+    Config, StartOpts, SOCKET_FD, TTRPC_ADDRESS,
 };
 
+pub mod cgroup_memory;
+pub mod console;
+pub mod container;
 pub mod monitor;
+pub mod processes;
 pub mod publisher;
+pub mod task;
 pub mod util;
 
 /// Asynchronous Main shim interface that must be implemented by all async shims.
@@ -81,13 +90,13 @@ pub trait Shim {
     /// - `id`: identifier of the shim/container, passed in from Containerd.
     /// - `namespace`: namespace of the shim/container, passed in from Containerd.
     /// - `config`: for the shim to pass back configuration information
-    async fn new(runtime_id: &str, args: &Flags, config: &mut Config) -> Self;
+    async fn new(runtime_id: &str, id: &str, namespace: &str, config: &mut Config) -> Self;
 
     /// Start shim will be called by containerd when launching new shim instance.
     ///
     /// It expected to return TTRPC address containerd daemon can use to communicate with
     /// the given shim instance.
-    /// See <https://github.com/containerd/containerd/tree/master/runtime/v2#start>
+    /// See https://github.com/containerd/containerd/tree/master/runtime/v2#start
     /// this is an asynchronous call
     async fn start_shim(&mut self, opts: StartOpts) -> Result<String>;
 
@@ -100,10 +109,15 @@ pub trait Shim {
 
     /// Create the task service object asynchronously.
     async fn create_task_service(&self, publisher: RemotePublisher) -> Self::T;
+
+    #[cfg(feature = "sandbox")]
+    type S: Sandbox + Send + Sync;
+
+    #[cfg(feature = "sandbox")]
+    async fn create_sandbox_service(&self) -> Self::S;
 }
 
 /// Async Shim entry point that must be invoked from tokio `main`.
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 pub async fn run<T>(runtime_id: &str, opts: Option<Config>)
 where
     T: Shim + Send + Sync + 'static,
@@ -113,53 +127,7 @@ where
         process::exit(1);
     }
 }
-/// get runtime info
-pub fn run_info() -> Result<RuntimeInfo> {
-    let mut info = introspection::RuntimeInfo {
-        name: "containerd-shim-runc-v2-rs".to_string(),
-        version: MessageField::some(introspection::RuntimeVersion {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            revision: String::default(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let mut binary_name = DEFAULT_BINARY_NAME.to_string();
-    let mut data: Vec<u8> = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut data)
-        .map_err(io_error!(e, "read stdin"))?;
-    // get BinaryName from stdin
-    if !data.is_empty() {
-        let opts =
-            Any::parse_from_bytes(&data).and_then(|any| Options::parse_from_bytes(&any.value))?;
-        if !opts.binary_name().is_empty() {
-            binary_name = opts.binary_name().to_string();
-        }
-    }
-    let binary_path = which(binary_name).unwrap();
 
-    // get features
-    let output = StdCommand::new(binary_path)
-        .arg("features")
-        .output()
-        .unwrap();
-
-    let features: Features = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))?;
-
-    // set features
-    let features_any = Any {
-        type_url: "types.containerd.io/opencontainers/runtime-spec/1/features/Features".to_string(),
-        // features to json
-        value: serde_json::to_vec(&features)?,
-        ..Default::default()
-    };
-    info.features = MessageField::some(features_any);
-
-    Ok(info)
-}
-
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 async fn bootstrap<T>(runtime_id: &str, opts: Option<Config>) -> Result<()>
 where
     T: Shim + Send + Sync + 'static,
@@ -179,7 +147,7 @@ where
         reap::set_subreaper()?;
     }
 
-    let mut shim = T::new(runtime_id, &flags, &mut config).await;
+    let mut shim = T::new(runtime_id, &flags.id, &flags.namespace, &mut config).await;
 
     match flags.action.as_str() {
         "start" => {
@@ -216,33 +184,25 @@ where
             Ok(())
         }
         _ => {
-            if flags.socket.is_empty() {
-                return Err(Error::InvalidArgument(String::from(
-                    "Shim socket cannot be empty",
-                )));
-            }
-
             if !config.no_setup_logger {
-                logger::init(
-                    flags.debug,
-                    &config.default_log_level,
-                    &flags.namespace,
-                    &flags.id,
-                )?;
+                logger::init(flags.debug)?;
             }
 
             let publisher = RemotePublisher::new(&ttrpc_address).await?;
-            let task = Box::new(shim.create_task_service(publisher).await)
-                as Box<dyn containerd_shim_protos::shim_async::Task + Send + Sync>;
-            let task_service = create_task(Arc::from(task));
-            let Some(mut server) = create_server_with_retry(&flags).await? else {
-                signal_server_started();
-                return Ok(());
-            };
-            server = server.register_service(task_service);
-            server.start().await?;
+            let task = shim.create_task_service(publisher).await;
+            let task_service = create_task(Arc::new(Box::new(task)));
+            let mut server = Server::new().register_service(task_service);
 
-            signal_server_started();
+            #[cfg(feature = "sandbox")]
+            {
+                let sandbox = shim.create_sandbox_service().await;
+                let sandbox_service = create_sandbox(Arc::new(Box::new(sandbox)));
+                server = server.register_service(sandbox_service);
+            }
+
+            server = server.add_listener(SOCKET_FD)?;
+            server = server.set_domain_unix();
+            server.start().await?;
 
             info!("Shim successfully started, waiting for exit signal...");
             tokio::spawn(async move {
@@ -297,28 +257,75 @@ impl ExitSignal {
             notified.await;
         }
     }
+
+    pub fn exited(&self) -> Exited {
+        let notified = self.notifier.notified();
+        Exited {
+            notified,
+            sig: self,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct Exited<'a> {
+        #[pin]
+        notified: Notified<'a>,
+        sig: &'a ExitSignal,
+    }
+}
+
+impl Future for Exited<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if this.sig.exited.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+        this.notified.poll(cx)
+    }
 }
 
 /// Spawn is a helper func to launch shim process asynchronously.
 /// Typically this expected to be called from `StartShim`.
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 pub async fn spawn(opts: StartOpts, grouping: &str, vars: Vec<(&str, &str)>) -> Result<String> {
     let cmd = env::current_exe().map_err(io_error!(e, ""))?;
     let cwd = env::current_dir().map_err(io_error!(e, ""))?;
     let address = socket_address(&opts.address, &opts.namespace, grouping);
 
-    // Activation pattern comes from the hcsshim: https://github.com/microsoft/hcsshim/blob/v0.10.0-rc.7/cmd/containerd-shim-runhcs-v1/serve.go#L57-L70
-    // another way to do it would to create named pipe and pass it to the child process through handle inheritence but that would require duplicating
-    // the logic in Rust's 'command' for process creation.  There is an  issue in Rust to make it simplier to specify handle inheritence and this could
-    // be revisited once https://github.com/rust-lang/rust/issues/54760 is implemented.
+    // Create socket and prepare listener.
+    // We'll use `add_listener` when creating TTRPC server.
+    let listener = match start_listener(&address).await {
+        Ok(l) => l,
+        Err(e) => {
+            if let Error::IoError {
+                err: ref io_err, ..
+            } = e
+            {
+                if io_err.kind() != std::io::ErrorKind::AddrInUse {
+                    return Err(e);
+                };
+            }
+            if let Ok(()) = wait_socket_working(&address, 5, 200).await {
+                write_str_to_file("address", &address).await?;
+                return Ok(address);
+            }
+            remove_socket(&address).await?;
+            start_listener(&address).await?
+        }
+    };
 
+    // tokio::process::Command do not have method `fd_mappings`,
+    // and the `spawn()` is also not an async method,
+    // so we use the std::process::Command here
     let mut command = Command::new(cmd);
+
     command
         .current_dir(cwd)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .envs(vars)
         .args([
             "-namespace",
             &opts.namespace,
@@ -326,151 +333,48 @@ pub async fn spawn(opts: StartOpts, grouping: &str, vars: Vec<(&str, &str)>) -> 
             &opts.id,
             "-address",
             &opts.address,
-            "-socket",
-            &address,
-        ]);
-
+        ])
+        .fd_mappings(vec![FdMapping {
+            parent_fd: listener.as_raw_fd(),
+            child_fd: SOCKET_FD,
+        }])?;
     if opts.debug {
         command.arg("-debug");
     }
+    command.envs(vars);
 
-    let mut child = command.spawn().map_err(io_error!(e, "spawn shim"))?;
-
+    let _child = command.spawn().map_err(io_error!(e, "spawn shim"))?;
     #[cfg(target_os = "linux")]
-    crate::cgroup::set_cgroup_and_oom_score(child.id().unwrap())?;
-
-    let mut reader = child.stdout.take().unwrap();
-    tokio::io::copy(&mut reader, &mut tokio::io::stderr())
-        .await
-        .unwrap();
-
+    crate::cgroup::set_cgroup_and_oom_score(_child.id())?;
+    std::mem::forget(listener);
     Ok(address)
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
-async fn create_server(flags: &args::Flags) -> Result<Server> {
-    use std::os::fd::IntoRawFd;
-    let listener = start_listener(&flags.socket).await?;
-    let mut server = Server::new();
-    server = server.add_listener(listener.into_raw_fd())?;
-    server = server.set_domain_unix();
-    Ok(server)
-}
-
-async fn create_server_with_retry(flags: &args::Flags) -> Result<Option<Server>> {
-    // Really try to create a server.
-    let server = match create_server(flags).await {
-        Ok(server) => server,
-        Err(Error::IoError { err, .. }) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            // If the address is already in use then make sure it is up and running and return the address
-            // This allows for running a single shim per container scenarios
-            if let Ok(()) = wait_socket_working(&flags.socket, 5, 200).await {
-                write_str_to_file("address", &flags.socket).await?;
-                return Ok(None);
-            }
-            remove_socket(&flags.socket).await?;
-            create_server(flags).await?
-        }
-        Err(e) => return Err(e),
-    };
-
-    Ok(Some(server))
-}
-
-fn signal_server_started() {
-    use libc::{dup2, STDERR_FILENO, STDOUT_FILENO};
-
-    unsafe {
-        if dup2(STDERR_FILENO, STDOUT_FILENO) < 0 {
-            panic!("Error closing pipe: {}", std::io::Error::last_os_error())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn signal_stream(kind: i32) -> std::io::Result<BoxStream<'static, i32>> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let kind = SignalKind::from_raw(kind);
-    signal(kind).map(|mut sig| {
-        // The object returned by `signal` is not a `Stream`.
-        // The `poll_fn` function constructs a `Stream` based on a polling function.
-        // We need to create a `Stream` so that we can use the `SelectAll` stream "merge"
-        // all the signal streams.
-        poll_fn(move |cx| {
-            ready!(sig.poll_recv(cx));
-            Poll::Ready(Some(kind.as_raw_value()))
-        })
-        .boxed()
-    })
-}
-
-#[cfg(windows)]
-fn signal_stream(kind: i32) -> std::io::Result<BoxStream<'static, i32>> {
-    use tokio::signal::windows::ctrl_c;
-
-    // Windows doesn't have similar signal like SIGCHLD
-    // We could implement something if required but for now
-    // just implement support for SIGINT
-    if kind != SIGINT {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Invalid signal {kind}"),
-        ));
-    }
-
-    ctrl_c().map(|mut sig| {
-        // The object returned by `signal` is not a `Stream`.
-        // The `poll_fn` function constructs a `Stream` based on a polling function.
-        // We need to create a `Stream` so that we can use the `SelectAll` stream "merge"
-        // all the signal streams.
-        poll_fn(move |cx| {
-            ready!(sig.poll_recv(cx));
-            Poll::Ready(Some(kind))
-        })
-        .boxed()
-    })
-}
-
-type Signals = SelectAll<BoxStream<'static, i32>>;
-
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
 fn setup_signals_tokio(config: &Config) -> Signals {
-    #[cfg(unix)]
-    let signals: &[i32] = if config.no_reaper {
-        &[SIGTERM, SIGINT, SIGPIPE]
+    if config.no_reaper {
+        Signals::new([SIGTERM, SIGINT, SIGPIPE]).expect("new signal failed")
     } else {
-        &[SIGTERM, SIGINT, SIGPIPE, SIGCHLD]
-    };
-
-    // Windows doesn't have similar signal like SIGCHLD
-    // We could implement something if required but for now
-    // just listen for SIGINT
-    // Note: see comment at the counterpart in synchronous/mod.rs for details.
-    #[cfg(windows)]
-    let signals: &[i32] = &[SIGINT];
-
-    let signals: Vec<_> = signals
-        .iter()
-        .copied()
-        .map(signal_stream)
-        .collect::<std::io::Result<_>>()
-        .expect("signal setup failed");
-
-    SelectAll::from_iter(signals)
+        Signals::new([SIGTERM, SIGINT, SIGPIPE, SIGCHLD]).expect("new signal failed")
+    }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
 async fn handle_signals(signals: Signals) {
     let mut signals = signals.fuse();
     while let Some(sig) = signals.next().await {
         match sig {
-            SIGPIPE => {}
             SIGTERM | SIGINT => {
                 debug!("received {}", sig);
             }
             SIGCHLD => loop {
                 // Note: see comment at the counterpart in synchronous/mod.rs for details.
-                match wait::waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+                match asyncify(move || {
+                    Ok(wait::waitpid(
+                        Some(Pid::from_raw(-1)),
+                        Some(WaitPidFlag::WNOHANG),
+                    )?)
+                })
+                .await
+                {
                     Ok(WaitStatus::Exited(pid, status)) => {
                         monitor_notify_by_pid(pid.as_raw(), status)
                             .await
@@ -483,10 +387,7 @@ async fn handle_signals(signals: Signals) {
                             .await
                             .unwrap_or_else(|e| error!("failed to send signal event {}", e))
                     }
-                    Ok(WaitStatus::StillAlive) => {
-                        break;
-                    }
-                    Err(Errno::ECHILD) => {
+                    Err(Error::Nix(Errno::ECHILD)) | Ok(WaitStatus::StillAlive) => {
                         break;
                     }
                     Err(e) => {
@@ -506,14 +407,12 @@ async fn handle_signals(signals: Signals) {
     }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 async fn remove_socket_silently(address: &str) {
     remove_socket(address)
         .await
         .unwrap_or_else(|e| warn!("failed to remove socket: {}", e))
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 async fn remove_socket(address: &str) -> Result<()> {
     let path = parse_sockaddr(address);
     if let Ok(md) = Path::new(path).metadata() {
@@ -528,7 +427,6 @@ async fn remove_socket(address: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "info"))]
 async fn start_listener(address: &str) -> Result<UnixListener> {
     let addr = address.to_string();
     asyncify(move || -> Result<UnixListener> {
@@ -540,7 +438,6 @@ async fn start_listener(address: &str) -> Result<UnixListener> {
     .await
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
 async fn wait_socket_working(address: &str, interval_in_ms: u64, count: u32) -> Result<()> {
     for _i in 0..count {
         match Client::connect(address) {

@@ -14,72 +14,23 @@
    limitations under the License.
 */
 
-use std::{env, io::Write};
-
-use containerd_shim::{
-    asynchronous::run,
-    parse,
-    protos::protobuf::{well_known_types::any::Any, Message},
-    run_info,
-};
-
-mod cgroup_memory;
+#[cfg(feature = "async")]
+mod asynchronous;
 mod common;
-mod console;
-mod container;
-mod io;
-mod processes;
-mod runc;
-mod service;
-mod task;
+#[cfg(not(feature = "async"))]
+mod synchronous;
 
-use service::Service;
-
-fn parse_version() {
-    let os_args: Vec<_> = env::args_os().collect();
-    let flags = match parse(&os_args[1..]) {
-        Ok(flags) => flags,
-        Err(e) => {
-            eprintln!("Error parsing arguments: {}", e);
-            std::process::exit(1);
-        }
-    };
-    if flags.version {
-        println!("{}:", os_args[0].to_string_lossy());
-        println!("  Version: {}", env!("CARGO_PKG_VERSION"));
-        println!("  Revision: {}", env!("CARGO_GIT_HASH"));
-        println!();
-
-        std::process::exit(0);
-    }
-    if flags.info {
-        let r = run_info();
-        match r {
-            Ok(rinfo) => {
-                let mut info = Any::new();
-                info.type_url = "io.containerd.runc.v2.Info".to_string();
-                info.value = match rinfo.write_to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        eprintln!("Failed to write runtime info to bytes: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                std::io::stdout()
-                    .write_all(info.write_to_bytes().unwrap().as_slice())
-                    .expect("Failed to write to stdout");
-            }
-            Err(_) => {
-                eprintln!("Failed to get runtime info");
-                std::process::exit(1);
-            }
-        }
-        std::process::exit(0);
-    }
+#[cfg(not(feature = "async"))]
+fn main() {
+    containerd_shim::run::<synchronous::Service>("io.containerd.runc.v2-rs", None)
 }
 
+#[cfg(feature = "async")]
 #[tokio::main]
 async fn main() {
-    parse_version();
-    run::<Service>("io.containerd.runc.v2-rs", None).await;
+    containerd_shim::asynchronous::run::<crate::asynchronous::Service>(
+        "io.containerd.runc.v2-rs",
+        None,
+    )
+    .await;
 }

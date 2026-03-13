@@ -32,8 +32,6 @@ fn main() {
             "vendor/github.com/containerd/containerd/protobuf/plugin/fieldpath.proto",
             "vendor/github.com/containerd/containerd/api/types/mount.proto",
             "vendor/github.com/containerd/containerd/api/types/task/task.proto",
-            "vendor/github.com/containerd/containerd/api/types/introspection.proto",
-            #[cfg(feature = "sandbox")]
             "vendor/github.com/containerd/containerd/api/types/platform.proto",
         ],
         false,
@@ -46,12 +44,6 @@ fn main() {
     );
 
     genmodule(
-        "stats",
-        &["vendor/microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats/stats.proto"],
-        false,
-    );
-
-    genmodule(
         "events",
         &[
             "vendor/github.com/containerd/containerd/api/types/mount.proto",
@@ -59,7 +51,6 @@ fn main() {
             "vendor/github.com/containerd/containerd/api/events/content.proto",
             "vendor/github.com/containerd/containerd/api/events/image.proto",
             "vendor/github.com/containerd/containerd/api/events/namespace.proto",
-            "vendor/github.com/containerd/containerd/api/events/sandbox.proto",
             "vendor/github.com/containerd/containerd/api/events/snapshot.proto",
             "vendor/github.com/containerd/containerd/api/events/task.proto",
         ],
@@ -70,7 +61,7 @@ fn main() {
         "shim",
         &[
             "vendor/github.com/containerd/containerd/runtime/v2/runc/options/oci.proto",
-            "vendor/github.com/containerd/containerd/api/runtime/task/v2/shim.proto",
+            "vendor/github.com/containerd/containerd/runtime/v2/task/shim.proto",
             "vendor/github.com/containerd/containerd/api/services/ttrpc/events/v1/events.proto",
         ],
         false,
@@ -81,22 +72,12 @@ fn main() {
         genmodule(
             "shim_async",
             &[
-                "vendor/github.com/containerd/containerd/api/runtime/task/v2/shim.proto",
+                "vendor/github.com/containerd/containerd/runtime/v2/task/shim.proto",
                 "vendor/github.com/containerd/containerd/api/services/ttrpc/events/v1/events.proto",
             ],
             true,
         );
-    }
 
-    #[cfg(feature = "sandbox")]
-    {
-        genmodule(
-            "sandbox",
-            &["vendor/github.com/containerd/containerd/api/runtime/sandbox/v1/sandbox.proto"],
-            false,
-        );
-
-        #[cfg(feature = "async")]
         genmodule(
             "sandbox_async",
             &["vendor/github.com/containerd/containerd/api/runtime/sandbox/v1/sandbox.proto"],

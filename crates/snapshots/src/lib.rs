@@ -14,15 +14,47 @@
    limitations under the License.
 */
 
-#![cfg_attr(feature = "docs", doc = include_str!("../README.md"))]
+//! Remote snapshotter extension for containerd.
+//!
+//! Snapshots crate implements containerd's proxy plugin for snapshotting. It aims hide the underlying
+//! complexity of GRPC interfaces, streaming and request/response conversions and provide one
+//! [crate::Snapshotter] trait to implement.
+//!
+//! # Proxy plugins
+//! A proxy plugin is configured using containerd's config file and will be loaded alongside the
+//! internal plugins when containerd is started. These plugins are connected to containerd using a
+//! local socket serving one of containerd's GRPC API services. Each plugin is configured with a
+//! type and name just as internal plugins are.
+//!
+//! # How to use from containerd
+//! Add the following to containerd's configuration file:
+//! ```toml
+//! [proxy_plugins]
+//!   [proxy_plugins.custom]
+//!     type = "snapshot"
+//!     address = "/tmp/snap2.sock"
+//! ```
+//! Start containerd daemon:
+//! ```bash
+//! containerd --config /path/config.toml
+//! ```
+//!
+//! Run remote snapshotter instance:
+//! ```bash
+//! $ cargo run --example snapshotter /tmp/snap2.sock
+//! ```
+//! Now specify `custom` snapshotter when pulling an image with `ctr`:
+//! ```bash
+//! $ ctr i pull --snapshotter custom docker.io/library/hello-world:latest
+//! ```
+//!
+
 // No way to derive Eq with tonic :(
 // See https://github.com/hyperium/tonic/issues/1056
 #![allow(clippy::derive_partial_eq_without_eq)]
 
 use std::{collections::HashMap, fmt::Debug, ops::AddAssign, time::SystemTime};
 
-use serde::{Deserialize, Serialize};
-use tokio_stream::Stream;
 pub use tonic;
 
 mod convert;
@@ -32,9 +64,6 @@ pub use wrap::server;
 
 /// Generated GRPC apis.
 pub mod api {
-    #![allow(clippy::tabs_in_doc_comments)]
-    #![allow(rustdoc::invalid_rust_codeblocks)]
-
     /// Generated snapshots bindings.
     pub mod snapshots {
         pub mod v1 {
@@ -49,17 +78,22 @@ pub mod api {
 }
 
 /// Snapshot kinds.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug)]
 pub enum Kind {
-    #[default]
     Unknown,
     View,
     Active,
     Committed,
 }
 
+impl Default for Kind {
+    fn default() -> Self {
+        Kind::Unknown
+    }
+}
+
 /// Information about a particular snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Info {
     /// Active or committed snapshot.
     pub kind: Kind,
@@ -92,7 +126,7 @@ impl Default for Info {
 ///
 // These resources only include the resources consumed by the snapshot itself and does not include
 // resources usage by the parent.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub struct Usage {
     /// Number of inodes in use.
     pub inodes: i64,
@@ -120,7 +154,7 @@ pub trait Snapshotter: Send + Sync + 'static {
     /// Error type returned from the underlying snapshotter implementation.
     ///
     /// This type must be convertable to GRPC status.
-    type Error: Debug + Into<tonic::Status> + Send;
+    type Error: Debug;
 
     /// Returns the info for an active or committed snapshot by name or key.
     ///
@@ -226,30 +260,4 @@ pub trait Snapshotter: Send + Sync + 'static {
     async fn clear(&self) -> Result<(), Self::Error> {
         Ok(())
     }
-
-    /// The type of the stream that returns all snapshots.
-    ///
-    /// An instance of this type is returned by [`Snapshotter::list`] on success.
-    type InfoStream: Stream<Item = Result<Info, Self::Error>> + Send + 'static;
-
-    /// Returns a stream containing all snapshots.
-    ///
-    /// Once `type_alias_impl_trait` is stabilized or if the implementer is willing to use unstable
-    /// features, this function can be implemented using `try_stream` and `yield`. For example, a
-    /// function that lists a single snapshot with the default values would be implemented as
-    /// follows:
-    ///
-    ///```ignore
-    ///     type InfoStream = impl Stream<Item = Result<Info, Self::Error>> + Send + 'static;
-    ///     fn list(&self) -> Result<Self::InfoStream, Self::Error> {
-    ///         Ok(async_stream::try_stream! {
-    ///             yield Info::default();
-    ///         })
-    ///     }
-    /// ```
-    async fn list(
-        &self,
-        snapshotter: String,
-        filters: Vec<String>,
-    ) -> Result<Self::InfoStream, Self::Error>;
 }

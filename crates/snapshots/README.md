@@ -41,21 +41,15 @@ $ ctr i pull --snapshotter custom docker.io/library/hello-world:latest
 ## Getting started
 
 Snapshotters are required to implement `Snapshotter` trait (which is very similar to containerd's
-[Snapshotter](https://github.com/containerd/containerd/blob/main/core/snapshots/snapshotter.go) interface).
+[Snapshotter](https://github.com/containerd/containerd/blob/main/snapshots/snapshotter.go) interface).
 
-```rust,ignore
-use std::collections::HashMap;
-
-use containerd_snapshots as snapshots;
-use containerd_snapshots::{api, Info, Usage};
-use log::info;
-
+```rust
 #[derive(Default)]
 struct Example;
 
 #[snapshots::tonic::async_trait]
 impl snapshots::Snapshotter for Example {
-    type Error = snapshots::tonic::Status;
+    type Error = ();
 
     async fn stat(&self, key: String) -> Result<Info, Self::Error> {
         info!("Stat: {}", key);
@@ -79,7 +73,8 @@ impl snapshots::Snapshotter for Example {
 The library provides `snapshots::server` for convenience to wrap the implementation into a GRPC server, so it can
 be used with `tonic` like this:
 
-```rust,ignore
+```rust
+
 use snapshots::tonic::transport::Server;
 
 Server::builder()

@@ -49,7 +49,10 @@ pub enum Error {
     #[error("Failed to setup logger: {0}")]
     Setup(#[from] log::SetLoggerError),
 
-    #[cfg(unix)]
+    /// Unable to pass fd to child process (we rely on `command_fds` crate for this).
+    #[error("Failed to pass socket fd to child: {0}")]
+    FdMap(#[from] command_fds::FdMappingCollision),
+
     #[error("Nix error: {0}")]
     Nix(#[from] nix::Error),
 
@@ -62,7 +65,6 @@ pub enum Error {
     #[error("Failed pre condition: {0}")]
     FailedPreconditionError(String),
 
-    #[cfg(unix)]
     #[error("{context} error: {err}")]
     MountError {
         context: String,
@@ -78,9 +80,6 @@ pub enum Error {
 
     #[error("Failed to send exit event: {0}")]
     Send(#[from] std::sync::mpsc::SendError<ExitEvent>),
-
-    #[error("Deadline exceeded: {0}")]
-    DeadlineExceeded(String),
 
     #[error("Other: {0}")]
     Other(String),
@@ -136,7 +135,7 @@ macro_rules! other {
 
 #[macro_export]
 macro_rules! other_error {
-    ($s:expr) => {
-        |e| Error::Other(format!("{}: {}", $s, e))
+    ($e:ident, $s:expr) => {
+        |$e| Error::Other($s.to_string() + &": ".to_string() + &$e.to_string())
     };
 }

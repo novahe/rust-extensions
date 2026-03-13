@@ -14,9 +14,11 @@
    limitations under the License.
 */
 
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    env,
+    os::{fd::IntoRawFd, unix::io::RawFd},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -99,10 +101,7 @@ impl From<JsonOptions> for Options {
     }
 }
 
-#[cfg(unix)]
 pub fn connect(address: impl AsRef<str>) -> Result<RawFd> {
-    use std::os::fd::IntoRawFd;
-
     use nix::{sys::socket::*, unistd::close};
 
     let unix_addr = UnixAddr::new(address.as_ref())?;
@@ -120,12 +119,8 @@ pub fn connect(address: impl AsRef<str>) -> Result<RawFd> {
     // so there is a chance of leak if fork + exec happens in between of these calls.
     #[cfg(not(target_os = "linux"))]
     {
-        use std::os::fd::BorrowedFd;
-
         use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-        // SAFETY: fd is a valid file descriptor that we just created
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        fcntl(borrowed_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|e| {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|e| {
             let _ = close(fd);
             e
         })?;
@@ -169,6 +164,13 @@ pub fn convert_to_any(obj: Box<dyn MessageDyn>) -> Result<Any> {
     any.type_url = obj.descriptor_dyn().full_name().to_string();
 
     Ok(any)
+}
+
+/// Returns a temp dir. If the environment variable "XDG_RUNTIME_DIR" is set, return its value.
+/// Otherwise if `std::env::temp_dir()` failed, return current dir or return the temp dir depended on OS.
+pub(crate) fn xdg_runtime_dir() -> String {
+    env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| env::temp_dir().to_str().unwrap_or(".").to_string())
 }
 
 pub trait IntoOption

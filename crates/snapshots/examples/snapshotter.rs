@@ -14,13 +14,7 @@
    limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    env,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{collections::HashMap, env};
 
 use containerd_snapshots as snapshots;
 use containerd_snapshots::{api, Info, Usage};
@@ -28,14 +22,13 @@ use futures::TryFutureExt;
 use log::info;
 use snapshots::tonic::transport::Server;
 use tokio::net::UnixListener;
-use tokio_stream::Stream;
 
 #[derive(Default)]
 struct Example;
 
 #[snapshots::tonic::async_trait]
 impl snapshots::Snapshotter for Example {
-    type Error = snapshots::tonic::Status;
+    type Error = String;
 
     async fn stat(&self, key: String) -> Result<Info, Self::Error> {
         info!("Stat: {}", key);
@@ -98,25 +91,6 @@ impl snapshots::Snapshotter for Example {
         info!("Remove: {}", key);
         Ok(())
     }
-
-    type InfoStream = EmptyStream;
-    async fn list(
-        &self,
-        snapshotter: String,
-        filters: Vec<String>,
-    ) -> Result<Self::InfoStream, Self::Error> {
-        info!("List: snapshotter={}, filters={:?}", snapshotter, filters);
-        // Returns no snapshots.
-        Ok(EmptyStream)
-    }
-}
-
-struct EmptyStream;
-impl Stream for EmptyStream {
-    type Item = Result<Info, snapshots::tonic::Status>;
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(None)
-    }
 }
 
 #[cfg(unix)]
@@ -133,7 +107,7 @@ async fn main() {
         .ok_or("First argument must be socket path")
         .unwrap();
 
-    let example = Example;
+    let example = Example::default();
 
     let incoming = {
         let uds = UnixListener::bind(socket_path).expect("Failed to bind listener");
@@ -147,7 +121,7 @@ async fn main() {
     };
 
     Server::builder()
-        .add_service(snapshots::server(Arc::new(example)))
+        .add_service(snapshots::server(example))
         .serve_with_incoming(incoming)
         .await
         .expect("Serve failed");
@@ -179,7 +153,6 @@ mod unix {
         }
     }
 
-    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub struct UdsConnectInfo {
         pub peer_addr: Option<Arc<tokio::net::unix::SocketAddr>>,

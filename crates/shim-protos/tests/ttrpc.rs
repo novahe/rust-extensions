@@ -55,16 +55,12 @@ fn create_ttrpc_context() -> (
         type_: MESSAGE_TYPE_REQUEST,
         ..Default::default()
     };
-
-    let (_, cancel_rx) = crossbeam::channel::unbounded();
-
     let ctx = TtrpcContext {
         fd: -1,
         mh,
         res_tx,
         metadata: HashMap::new(),
         timeout_nano: 0,
-        cancel_rx,
     };
 
     (ctx, rx)
@@ -72,7 +68,9 @@ fn create_ttrpc_context() -> (
 
 #[test]
 fn test_task_method_num() {
-    let task = create_task(Arc::new(FakeServer::new()));
+    let server = Arc::new(Box::new(FakeServer::new()) as Box<dyn Task + Send + Sync>);
+    let task = create_task(server.clone());
+
     assert_eq!(task.len(), 17);
 }
 
@@ -96,7 +94,8 @@ fn test_create_task() {
     request.set_timeout_nano(10000);
     request.set_metadata(ttrpc::context::to_pb(ctx.metadata.clone()));
 
-    let task = create_task(Arc::new(FakeServer::new()));
+    let server = Arc::new(Box::new(FakeServer::new()) as Box<dyn Task + Send + Sync>);
+    let task = create_task(server.clone());
     let create = task.get("/containerd.task.v2.Task/Create").unwrap();
     create.handler(ctx, request).unwrap();
 
@@ -137,7 +136,8 @@ fn test_delete_task() {
     request.set_timeout_nano(10000);
     request.set_metadata(ttrpc::context::to_pb(ctx.metadata.clone()));
 
-    let task = create_task(Arc::new(FakeServer::new()));
+    let server = Arc::new(Box::new(FakeServer::new()) as Box<dyn Task + Send + Sync>);
+    let task = create_task(server.clone());
     let delete = task.get("/containerd.task.v2.Task/Delete").unwrap();
     delete.handler(ctx, request).unwrap();
 

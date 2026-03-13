@@ -16,9 +16,9 @@
 
 //! Trait wrapper to server GRPC requests.
 
-use std::{convert::TryInto, mem, sync::Arc};
+use std::{convert::TryInto, fmt::Debug};
 
-use futures::{stream::BoxStream, StreamExt};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     api::snapshots::v1::{
@@ -29,11 +29,11 @@ use crate::{
 };
 
 pub struct Wrapper<S: Snapshotter> {
-    snapshotter: Arc<S>,
+    snapshotter: S,
 }
 
 /// Helper to create snapshots server from any object that implements [Snapshotter] trait.
-pub fn server<S: Snapshotter>(snapshotter: Arc<S>) -> SnapshotsServer<Wrapper<S>> {
+pub fn server<S: Snapshotter>(snapshotter: S) -> SnapshotsServer<Wrapper<S>> {
     SnapshotsServer::new(Wrapper { snapshotter })
 }
 
@@ -45,13 +45,17 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
     ) -> Result<tonic::Response<PrepareSnapshotResponse>, tonic::Status> {
         let request = request.into_inner();
 
-        let mounts = self
+        match self
             .snapshotter
             .prepare(request.key, request.parent, request.labels)
             .await
-            .map_err(Into::into)?;
-        let message = PrepareSnapshotResponse { mounts };
-        Ok(tonic::Response::new(message))
+        {
+            Ok(mounts) => {
+                let message = PrepareSnapshotResponse { mounts };
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn view(
@@ -59,13 +63,18 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<ViewSnapshotRequest>,
     ) -> Result<tonic::Response<ViewSnapshotResponse>, tonic::Status> {
         let request = request.into_inner();
-        let mounts = self
+
+        match self
             .snapshotter
             .view(request.key, request.parent, request.labels)
             .await
-            .map_err(Into::into)?;
-        let message = ViewSnapshotResponse { mounts };
-        Ok(tonic::Response::new(message))
+        {
+            Ok(mounts) => {
+                let message = ViewSnapshotResponse { mounts };
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn mounts(
@@ -73,13 +82,14 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<MountsRequest>,
     ) -> Result<tonic::Response<MountsResponse>, tonic::Status> {
         let request = request.into_inner();
-        let mounts = self
-            .snapshotter
-            .mounts(request.key)
-            .await
-            .map_err(Into::into)?;
-        let message = MountsResponse { mounts };
-        Ok(tonic::Response::new(message))
+
+        match self.snapshotter.mounts(request.key).await {
+            Ok(mounts) => {
+                let message = MountsResponse { mounts };
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn commit(
@@ -87,11 +97,15 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<CommitSnapshotRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let request = request.into_inner();
-        self.snapshotter
+
+        match self
+            .snapshotter
             .commit(request.name, request.key, request.labels)
             .await
-            .map_err(Into::into)?;
-        Ok(tonic::Response::new(()))
+        {
+            Ok(_) => Ok(tonic::Response::new(())),
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn remove(
@@ -99,11 +113,11 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<RemoveSnapshotRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let request = request.into_inner();
-        self.snapshotter
-            .remove(request.key)
-            .await
-            .map_err(Into::into)?;
-        Ok(tonic::Response::new(()))
+
+        match self.snapshotter.remove(request.key).await {
+            Ok(_) => Ok(tonic::Response::new(())),
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn stat(
@@ -111,15 +125,17 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<StatSnapshotRequest>,
     ) -> Result<tonic::Response<StatSnapshotResponse>, tonic::Status> {
         let request = request.into_inner();
-        let info = self
-            .snapshotter
-            .stat(request.key)
-            .await
-            .map_err(Into::into)?;
-        let message = StatSnapshotResponse {
-            info: Some(info.into()),
-        };
-        Ok(tonic::Response::new(message))
+
+        match self.snapshotter.stat(request.key).await {
+            Ok(info) => {
+                let message = StatSnapshotResponse {
+                    info: Some(info.into()),
+                };
+
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn update(
@@ -127,6 +143,7 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
         request: tonic::Request<UpdateSnapshotRequest>,
     ) -> Result<tonic::Response<UpdateSnapshotResponse>, tonic::Status> {
         let request = request.into_inner();
+
         let info = match request.info {
             Some(info) => info,
             None => return Err(tonic::Status::failed_precondition("info is required")),
@@ -142,42 +159,25 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
 
         let fields = request.update_mask.map(|mask| mask.paths);
 
-        let info = self
-            .snapshotter
-            .update(info, fields)
-            .await
-            .map_err(Into::into)?;
-        let message = UpdateSnapshotResponse {
-            info: Some(info.into()),
-        };
+        match self.snapshotter.update(info, fields).await {
+            Ok(info) => {
+                let message = UpdateSnapshotResponse {
+                    info: Some(info.into()),
+                };
 
-        Ok(tonic::Response::new(message))
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
-    type ListStream = BoxStream<Result<ListSnapshotsResponse, tonic::Status>, 'static>;
+    type ListStream = ReceiverStream<Result<ListSnapshotsResponse, tonic::Status>>;
 
     async fn list(
         &self,
-        request: tonic::Request<ListSnapshotsRequest>,
+        _request: tonic::Request<ListSnapshotsRequest>,
     ) -> Result<tonic::Response<Self::ListStream>, tonic::Status> {
-        let request = request.into_inner();
-        let sn = self.snapshotter.clone();
-        let output = async_stream::try_stream! {
-            let walk_stream = sn.list(request.snapshotter, request.filters).await?;
-            pin_utils::pin_mut!(walk_stream);
-            let mut infos = Vec::<Info>::new();
-            while let Some(info) = walk_stream.next().await {
-                infos.push(info?.into());
-                if infos.len() >= 100 {
-                    yield ListSnapshotsResponse { info: mem::take(&mut infos) };
-                }
-            }
-
-            if !infos.is_empty() {
-                yield ListSnapshotsResponse { info: infos };
-            }
-        };
-        Ok(tonic::Response::new(Box::pin(output)))
+        Err(tonic::Status::unimplemented("not implemented"))
     }
 
     async fn usage(
@@ -186,24 +186,31 @@ impl<S: Snapshotter> Snapshots for Wrapper<S> {
     ) -> Result<tonic::Response<UsageResponse>, tonic::Status> {
         let request = request.into_inner();
 
-        let usage = self
-            .snapshotter
-            .usage(request.key)
-            .await
-            .map_err(Into::into)?;
-        let message = UsageResponse {
-            size: usage.size,
-            inodes: usage.inodes,
-        };
+        match self.snapshotter.usage(request.key).await {
+            Ok(usage) => {
+                let message = UsageResponse {
+                    size: usage.size,
+                    inodes: usage.inodes,
+                };
 
-        Ok(tonic::Response::new(message))
+                Ok(tonic::Response::new(message))
+            }
+            Err(err) => Err(status(err)),
+        }
     }
 
     async fn cleanup(
         &self,
         _request: tonic::Request<CleanupRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        self.snapshotter.clear().await.map_err(Into::into)?;
-        Ok(tonic::Response::new(()))
+        match self.snapshotter.clear().await {
+            Ok(_) => Ok(tonic::Response::new(())),
+            Err(err) => Err(status(err)),
+        }
     }
+}
+
+fn status<E: Debug>(err: E) -> tonic::Status {
+    let message = format!("{:?}", err);
+    tonic::Status::internal(message)
 }

@@ -19,7 +19,7 @@ use std::path::Path;
 use containerd_shim_protos::{api::Mount, shim::oci::Options};
 use libc::mode_t;
 use nix::sys::stat::Mode;
-use oci_spec::runtime::Spec;
+use serde::de::DeserializeOwned;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -38,7 +38,7 @@ where
 {
     spawn_blocking(f)
         .await
-        .map_err(other_error!("failed to spawn blocking task"))?
+        .map_err(other_error!(e, "failed to spawn blocking task"))?
 }
 
 pub async fn read_file_to_str(path: impl AsRef<Path>) -> Result<String> {
@@ -87,28 +87,17 @@ pub async fn write_str_to_file(filename: impl AsRef<Path>, s: impl AsRef<str>) -
     Ok(())
 }
 
-pub async fn read_pid_from_file(pid_path: &Path) -> Result<i32> {
-    let pid_str = read_file_to_str(pid_path).await?;
-    let pid = pid_str.parse::<i32>()?;
-    Ok(pid)
-}
-
-pub async fn read_spec(bundle: impl AsRef<Path>) -> Result<Spec> {
+pub async fn read_spec<T: DeserializeOwned>(bundle: impl AsRef<Path>) -> Result<T> {
     let path = bundle.as_ref().join(CONFIG_FILE_NAME);
     let content = read_file_to_str(&path).await?;
-    serde_json::from_str::<Spec>(content.as_str()).map_err(other_error!("read spec"))
+    serde_json::from_str::<T>(content.as_str()).map_err(other_error!(e, "read spec"))
 }
 
-// read_options reads the option information from the path.
-// When the file does not exist, read_options returns nil without an error.
 pub async fn read_options(bundle: impl AsRef<Path>) -> Result<Options> {
     let path = bundle.as_ref().join(OPTIONS_FILE_NAME);
-    if !path.exists() {
-        return Ok(Options::default());
-    }
     let opts_str = read_file_to_str(path).await?;
     let opts =
-        serde_json::from_str::<JsonOptions>(&opts_str).map_err(other_error!("read options"))?;
+        serde_json::from_str::<JsonOptions>(&opts_str).map_err(other_error!(e, "read options"))?;
     Ok(opts.into())
 }
 

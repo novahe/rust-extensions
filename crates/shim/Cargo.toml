@@ -1,13 +1,9 @@
 [package]
 name = "containerd-shim"
-version = "0.10.0"
-authors = [
-    "Maksym Pavlenko <pavlenko.maksym@gmail.com>",
-    "The containerd Authors",
-]
-description = "containerd shim extension"
+version = "0.3.0"
+authors = ["Maksym Pavlenko <pavlenko.maksym@gmail.com>", "The containerd Authors"]
 keywords = ["containerd", "shim", "containers"]
-categories = ["api-bindings", "asynchronous"]
+description = "containerd shim extension"
 
 edition.workspace = true
 license.workspace = true
@@ -15,69 +11,43 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-async = ["async-trait", "containerd-shim-protos/async", "futures", "tokio"]
-tracing = ["dep:tracing"]
-docs = []
+async = ["tokio", "containerd-shim-protos/async", "async-trait", "futures", "signal-hook-tokio", "pin-project-lite"]
+sandbox = ["async"]
+fdstore = ["containerd-shim-protos/fdstore"]
 
 [[example]]
 name = "skeleton_async"
 required-features = ["async"]
 
-[[example]]
-name = "windows-log-reader"
-path = "examples/windows_log_reader.rs"
-
 [dependencies]
-which = "8.0.0"
-containerd-shim-protos = { path = "../shim-protos", version = "0.10.0" }
 go-flag = "0.1.0"
+thiserror = "1.0"
+log = { version = "0.4", features = ["std"] }
+libc = "0.2.95"
+nix = { version = "0.28.0", features = ["mount", "socket", "ioctl", "signal", "fs", "event"] }
+command-fds = "0.2.1"
 lazy_static = "1.4.0"
-sha2 = "0.10.2"
-libc.workspace = true
-log = { workspace = true, features = ["std", "kv_unstable"] }
-nix = { workspace = true, features = [
-    "ioctl",
-    "fs",
-    "socket",
-    "signal",
-    "mount",
-    "sched",
-] }
-oci-spec.workspace = true
-page_size = "0.6.0"
-prctl.workspace = true
+time = { version = "0.3.7", features = ["serde", "std"] }
+serde_json = "1.0.78"
+serde_derive = "1.0.136"
+serde = "1.0.136"
+uuid = { version = "1.0.0", features = ["v4"] }
 signal-hook = "0.3.13"
-serde.workspace = true
-serde_json.workspace = true
-tempfile.workspace = true
-thiserror.workspace = true
-time.workspace = true
+oci-spec = "0.5.4"
+prctl = "1.0.0"
+page_size = "0.4.2"
+regex = "1"
 
-# tracing
-tracing = { version = "0.1", optional = true }
+containerd-shim-protos = { path = "../shim-protos", version = "0.2.0", features = ["async"] }
 
-# Async dependencies
-async-trait = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["full"], optional = true }
+async-trait = { version = "0.1.51", optional = true }
+tokio = { version = "1.17.0", features = ["full"], optional = true }
+futures = { version = "0.3.21", optional = true }
+signal-hook-tokio = { version = "0.3.1", optional = true, features = ["futures-v0_3"] }
+pin-project-lite = { version = "0.2.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cgroups-rs.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-mio = { version = "1.0", features = ["os-ext", "os-poll"] }
-windows-sys = { version = "0.52.0", features = [
-    "Win32_Foundation",
-    "Win32_System_WindowsProgramming",
-    "Win32_System_Console",
-    "Win32_System_Pipes",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
-] }
+cgroups-rs = "0.2.9"
 
 [dev-dependencies]
-tempfile.workspace = true
-
-[package.metadata.docs.rs]
-features = ["docs"]
+tempfile = "3.0"

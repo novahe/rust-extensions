@@ -22,13 +22,7 @@ const PROTO_FILES: &[&str] = &[
     "vendor/github.com/containerd/containerd/api/types/metrics.proto",
     "vendor/github.com/containerd/containerd/api/types/mount.proto",
     "vendor/github.com/containerd/containerd/api/types/platform.proto",
-    "vendor/github.com/containerd/containerd/api/types/sandbox.proto",
     "vendor/github.com/containerd/containerd/api/types/task/task.proto",
-    "vendor/github.com/containerd/containerd/api/types/transfer/imagestore.proto",
-    "vendor/github.com/containerd/containerd/api/types/transfer/importexport.proto",
-    "vendor/github.com/containerd/containerd/api/types/transfer/progress.proto",
-    "vendor/github.com/containerd/containerd/api/types/transfer/registry.proto",
-    "vendor/github.com/containerd/containerd/api/types/transfer/streaming.proto",
     // Services
     "vendor/github.com/containerd/containerd/api/services/containers/v1/containers.proto",
     "vendor/github.com/containerd/containerd/api/services/content/v1/content.proto",
@@ -38,12 +32,9 @@ const PROTO_FILES: &[&str] = &[
     "vendor/github.com/containerd/containerd/api/services/introspection/v1/introspection.proto",
     "vendor/github.com/containerd/containerd/api/services/leases/v1/leases.proto",
     "vendor/github.com/containerd/containerd/api/services/namespaces/v1/namespace.proto",
-    "vendor/github.com/containerd/containerd/api/services/sandbox/v1/sandbox.proto",
     "vendor/github.com/containerd/containerd/api/services/snapshots/v1/snapshots.proto",
-    "vendor/github.com/containerd/containerd/api/services/streaming/v1/streaming.proto",
-    "vendor/github.com/containerd/containerd/api/services/tasks/v1/tasks.proto",
-    "vendor/github.com/containerd/containerd/api/services/transfer/v1/transfer.proto",
     "vendor/github.com/containerd/containerd/api/services/version/v1/version.proto",
+    "vendor/github.com/containerd/containerd/api/services/tasks/v1/tasks.proto",
     // Events
     "vendor/github.com/containerd/containerd/api/events/container.proto",
     "vendor/github.com/containerd/containerd/api/events/content.proto",
@@ -57,22 +48,14 @@ const FIXUP_MODULES: &[&str] = &[
     "containerd.services.diff.v1",
     "containerd.services.images.v1",
     "containerd.services.introspection.v1",
-    "containerd.services.sandbox.v1",
     "containerd.services.snapshots.v1",
     "containerd.services.tasks.v1",
-    "containerd.services.containers.v1",
-    "containerd.services.content.v1",
-    "containerd.services.events.v1",
 ];
 
 fn main() {
-    let mut config = tonic_prost_build::Config::new();
-    config.protoc_arg("--experimental_allow_proto3_optional");
-    config.enable_type_names();
-
-    tonic_prost_build::configure()
+    tonic_build::configure()
         .build_server(false)
-        .compile_with_config(config, PROTO_FILES, &["vendor/"])
+        .compile(PROTO_FILES, &["vendor/"])
         .expect("Failed to generate GRPC bindings");
 
     for module in FIXUP_MODULES {
@@ -97,16 +80,8 @@ fn fixup_imports(path: &str) -> Result<(), io::Error> {
 
     let contents = fs::read_to_string(&path)?
         .replace("super::super::super::v1::types", "crate::types::v1") // for tasks service
-        .replace("super::super::super::super::types", "crate::types")
         .replace("super::super::super::types", "crate::types")
-        .replace("super::super::super::super::google", "crate::google")
-        .replace(
-            "/// 	filters\\[0\\] or filters\\[1\\] or ... or filters\\[n-1\\] or filters\\[n\\]",
-            r#"
-            /// ```notrust
-            /// 	filters[0] or filters[1] or ... or filters[n-1] or filters[n]
-            /// ```"#,
-        );
+        .replace("super::super::super::super::google", "crate::google");
     fs::write(path, contents)?;
     Ok(())
 }
