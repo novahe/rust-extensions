@@ -658,7 +658,8 @@ impl Spawner for ShimExecutor {
         let (stdout, stderr, exit_code) = (
             read_std(child.stdout),
             read_std(child.stderr),
-            wait_pid(pid as i32, subscription).map_err(|e| runc::error::Error::Other(Box::new(e)))?,
+            wait_pid(pid as i32, subscription)
+                .map_err(|e| runc::error::Error::Other(Box::new(e)))?,
         );
         let status = ExitStatus::from_raw(exit_code);
         Ok((status, pid, stdout, stderr))

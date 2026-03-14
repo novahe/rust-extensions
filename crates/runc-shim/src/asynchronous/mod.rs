@@ -16,7 +16,6 @@
 
 use std::{env::current_dir, sync::Arc};
 
-use oci_spec::runtime::Spec;
 use ::runc::options::DeleteOpts;
 use async_trait::async_trait;
 use containerd_shim::{
@@ -39,6 +38,7 @@ use containerd_shim::{
     Config, Context, DeleteResponse, Error, StartOpts,
 };
 use log::{debug, error, warn};
+use oci_spec::runtime::Spec;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::{
@@ -57,6 +57,8 @@ pub(crate) struct Service {
 #[async_trait]
 impl Shim for Service {
     type T = TaskService<RuncFactory, RuncContainer>;
+    #[cfg(feature = "sandbox")]
+    type S = containerd_shim::asynchronous::NoopSandboxService;
 
     async fn new(_runtime_id: &str, id: &str, namespace: &str, _config: &mut Config) -> Self {
         let exit = Arc::new(ExitSignal::default());
@@ -68,19 +70,21 @@ impl Shim for Service {
         }
     }
 
+    #[cfg(feature = "sandbox")]
+    async fn create_sandbox_service(&self) -> Self::S {
+        containerd_shim::asynchronous::NoopSandboxService
+    }
+
     async fn start_shim(&mut self, opts: StartOpts) -> containerd_shim::Result<String> {
         let mut grouping = opts.id.clone();
-        let spec:Spec = read_spec("").await?;
-        match spec.annotations() {
-            Some(annotations) => {
-                for &label in GROUP_LABELS.iter() {
-                    if let Some(value) = annotations.get(label) {
-                        grouping = value.to_string();
-                        break;
-                    }
+        let spec: Spec = read_spec("").await?;
+        if let Some(annotations) = spec.annotations() {
+            for &label in GROUP_LABELS.iter() {
+                if let Some(value) = annotations.get(label) {
+                    grouping = value.to_string();
+                    break;
                 }
             }
-            None => {}
         }
 
         let address = spawn(opts, &grouping, Vec::new()).await?;

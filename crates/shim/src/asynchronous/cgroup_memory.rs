@@ -16,28 +16,26 @@
 
 #![cfg(target_os = "linux")]
 
-use cgroups_rs::hierarchies::is_cgroup2_unified_mode;
-use log::warn;
 use std::{
     os::unix::io::{AsRawFd, FromRawFd},
     path::Path,
 };
 
-use crate::{
-    error::{Error, Result},
-    io_error, other_error,
-};
-
-use crate::event::Event;
-use containerd_shim_protos::events::task::TaskOOM;
-use containerd_shim_protos::protobuf::MessageDyn;
+use cgroups_rs::hierarchies::is_cgroup2_unified_mode;
+use containerd_shim_protos::{events::task::TaskOOM, protobuf::MessageDyn};
+use log::warn;
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use tokio::sync::mpsc::Sender;
 use tokio::{
     fs::{self, read_to_string, File},
     io::AsyncReadExt,
     spawn,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
+};
+
+use crate::{
+    error::{Error, Result},
+    event::Event,
+    io_error, other_error,
 };
 
 pub type EventSender = Sender<(String, Box<dyn MessageDyn>)>;
@@ -155,7 +153,7 @@ pub async fn register_memory_event(
         let mut eventfd_file = unsafe { File::from_raw_fd(eventfd.as_raw_fd()) };
         loop {
             match eventfd_file.read(&mut buf).await {
-                Ok(bytes_read) if bytes_read == 0 => return,
+                Ok(0) => return,
                 Err(_) => return,
                 _ => (),
             }
@@ -173,15 +171,16 @@ pub async fn register_memory_event(
 mod tests {
     use std::path::Path;
 
-    use crate::asynchronous::cgroup_memory::{
-        get_existing_cgroup_mem_path, get_path_from_cgorup, register_memory_event,
-    };
     use cgroups_rs::{
         hierarchies::{self, is_cgroup2_unified_mode},
         memory::MemController,
         Cgroup, CgroupPid,
     };
     use tokio::{fs::remove_file, io::AsyncWriteExt, process::Command};
+
+    use crate::asynchronous::cgroup_memory::{
+        get_existing_cgroup_mem_path, get_path_from_cgorup, register_memory_event,
+    };
 
     #[tokio::test]
     async fn test_cgroupv1_oom_monitor() {

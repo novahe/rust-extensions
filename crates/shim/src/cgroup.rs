@@ -248,7 +248,7 @@ pub fn collect_metrics(pid: u32) -> Result<Metrics> {
     Ok(metrics)
 }
 
-fn set_cpu_usage_and_throttle(stat: &String, cpu_stat: &mut CPUStat) {
+fn set_cpu_usage_and_throttle(stat: &str, cpu_stat: &mut CPUStat) {
     for line in stat.lines() {
         let parts = line.split_whitespace().collect::<Vec<&str>>();
         if parts.len() == 2 {

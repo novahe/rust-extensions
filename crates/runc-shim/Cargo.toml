@@ -21,6 +21,7 @@ doc = false
 
 [features]
 async = ["containerd-shim/async", "runc/async", "tokio", "futures", "async-trait"]
+sandbox = ["containerd-shim/sandbox"]
 
 [dependencies]
 log = "0.4"

@@ -14,7 +14,15 @@
    limitations under the License.
 */
 
-use std::{fs::File, io::IoSliceMut, ops::Deref, os::{fd::FromRawFd, unix::io::RawFd}, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::IoSliceMut,
+    ops::Deref,
+    os::{fd::FromRawFd, unix::io::RawFd},
+    path::Path,
+    sync::Arc,
+};
+
 use containerd_shim::{
     api::{ExecProcessRequest, Options},
     io::Stdio,

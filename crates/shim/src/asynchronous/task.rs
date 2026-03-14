@@ -32,7 +32,6 @@ use log::{debug, error, info, warn};
 use oci_spec::runtime::LinuxResources;
 use tokio::sync::{mpsc::Sender, MappedMutexGuard, Mutex, MutexGuard};
 
-use crate::asynchronous::cgroup_memory::monitor_oom;
 use crate::{
     api::{
         CreateTaskRequest, CreateTaskResponse, DeleteRequest, Empty, ExecProcessRequest,
@@ -40,6 +39,7 @@ use crate::{
         StateResponse, Status, WaitRequest, WaitResponse,
     },
     asynchronous::{
+        cgroup_memory::monitor_oom,
         container::{Container, ContainerFactory},
         ExitSignal,
     },
@@ -387,7 +387,7 @@ where
         let container = self.get_container(req.id()).await?;
 
         Ok(ConnectResponse {
-            shim_pid: std::process::id() as u32,
+            shim_pid: std::process::id(),
             task_pid: container.pid().await as u32,
             ..Default::default()
         })

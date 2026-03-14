@@ -350,6 +350,13 @@ impl Io for FIFO {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "async"))]
+    use std::{
+        fs,
+        io::{Read, Write},
+        os::unix::io::FromRawFd,
+    };
+
     use super::*;
 
     #[cfg(not(target_os = "macos"))]
@@ -381,25 +388,37 @@ mod tests {
         stdin.write_all(&buf).unwrap();
         buf[0] = 0x0;
 
-        io.stdin
-            .as_ref()
-            .map(|v| v.rd.try_clone().unwrap().read(&mut buf).unwrap());
+        io.stdin.as_ref().map(|v| {
+            unsafe { fs::File::from_raw_fd(v.rd) }
+                .try_clone()
+                .unwrap()
+                .read(&mut buf)
+                .unwrap()
+        });
         assert_eq!(&buf, &[0xfau8]);
 
         let mut stdout = io.stdout().unwrap();
         buf[0] = 0xce;
-        io.stdout
-            .as_ref()
-            .map(|v| v.wr.try_clone().unwrap().write(&buf).unwrap());
+        io.stdout.as_ref().map(|v| {
+            unsafe { fs::File::from_raw_fd(v.wr) }
+                .try_clone()
+                .unwrap()
+                .write(&buf)
+                .unwrap()
+        });
         buf[0] = 0x0;
         stdout.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &[0xceu8]);
 
         let mut stderr = io.stderr().unwrap();
         buf[0] = 0xa5;
-        io.stderr
-            .as_ref()
-            .map(|v| v.wr.try_clone().unwrap().write(&buf).unwrap());
+        io.stderr.as_ref().map(|v| {
+            unsafe { fs::File::from_raw_fd(v.wr) }
+                .try_clone()
+                .unwrap()
+                .write(&buf)
+                .unwrap()
+        });
         buf[0] = 0x0;
         stderr.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &[0xa5u8]);

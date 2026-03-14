@@ -73,10 +73,10 @@ pub fn spawn_copy_for_tty<R: Read + Send + 'static, W: Write + Send + 'static>(
     })
 }
 
-pub fn copy<R: ?Sized, W: ?Sized>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+pub fn copy<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
 where
-    R: Read,
-    W: Write,
+    R: Read + ?Sized,
+    W: Write + ?Sized,
 {
     let mut buf = [0u8; DEFAULT_BUF_SIZE];
     let mut written = 0;

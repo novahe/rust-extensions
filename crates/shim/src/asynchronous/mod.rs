@@ -33,7 +33,7 @@ use std::{
 use async_trait::async_trait;
 use command_fds::{CommandFdExt, FdMapping};
 #[cfg(feature = "sandbox")]
-use containerd_shim_protos::sandbox::sandbox_ttrpc::{create_sandbox, Sandbox};
+use containerd_shim_protos::sandbox::sandbox_ttrpc::create_sandbox;
 use containerd_shim_protos::{
     api::DeleteResponse,
     protobuf::Message,
@@ -75,6 +75,93 @@ pub mod publisher;
 pub mod task;
 pub mod util;
 
+#[cfg(feature = "sandbox")]
+#[derive(Clone, Default)]
+pub struct NoopSandboxService;
+
+#[cfg(feature = "sandbox")]
+#[async_trait]
+impl containerd_shim_protos::sandbox::sandbox_ttrpc::Sandbox for NoopSandboxService {
+    async fn create_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::CreateSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::CreateSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::CreateSandboxResponse::default())
+    }
+
+    async fn start_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::StartSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::StartSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::StartSandboxResponse::default())
+    }
+
+    async fn platform(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::PlatformRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::PlatformResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::PlatformResponse::default())
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::StopSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::StopSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::StopSandboxResponse::default())
+    }
+
+    async fn wait_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::WaitSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::WaitSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::WaitSandboxResponse::default())
+    }
+
+    async fn sandbox_status(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::SandboxStatusRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::SandboxStatusResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::SandboxStatusResponse::default())
+    }
+
+    async fn ping_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::PingRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<containerd_shim_protos::sandbox::sandbox::PingResponse>
+    {
+        Ok(containerd_shim_protos::sandbox::sandbox::PingResponse::default())
+    }
+
+    async fn shutdown_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::r#async::TtrpcContext,
+        _req: containerd_shim_protos::sandbox::sandbox::ShutdownSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::ShutdownSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::ShutdownSandboxResponse::default())
+    }
+}
+
 /// Asynchronous Main shim interface that must be implemented by all async shims.
 ///
 /// Start and delete routines will be called to handle containerd's shim lifecycle requests.
@@ -82,6 +169,10 @@ pub mod util;
 pub trait Shim {
     /// Type to provide task service for the shim.
     type T: Task + Send + Sync;
+
+    /// Type to provide sandbox service for the shim.
+    #[cfg(feature = "sandbox")]
+    type S: containerd_shim_protos::sandbox::sandbox_ttrpc::Sandbox + Send + Sync;
 
     /// Create a new instance of  async Shim.
     ///
@@ -91,6 +182,10 @@ pub trait Shim {
     /// - `namespace`: namespace of the shim/container, passed in from Containerd.
     /// - `config`: for the shim to pass back configuration information
     async fn new(runtime_id: &str, id: &str, namespace: &str, config: &mut Config) -> Self;
+
+    /// Create the sandbox service object.
+    #[cfg(feature = "sandbox")]
+    async fn create_sandbox_service(&self) -> Self::S;
 
     /// Start shim will be called by containerd when launching new shim instance.
     ///
@@ -109,12 +204,6 @@ pub trait Shim {
 
     /// Create the task service object asynchronously.
     async fn create_task_service(&self, publisher: RemotePublisher) -> Self::T;
-
-    #[cfg(feature = "sandbox")]
-    type S: Sandbox + Send + Sync;
-
-    #[cfg(feature = "sandbox")]
-    async fn create_sandbox_service(&self) -> Self::S;
 }
 
 /// Async Shim entry point that must be invoked from tokio `main`.
@@ -260,10 +349,10 @@ impl ExitSignal {
 
     pub fn exited(&self) -> Exited {
         let notified = self.notifier.notified();
-        return Exited {
+        Exited {
             notified,
-            sig: &self,
-        };
+            sig: self,
+        }
     }
 }
 
@@ -283,7 +372,7 @@ impl Future for Exited<'_> {
         if this.sig.exited.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
-        return this.notified.poll(cx);
+        this.notified.poll(cx)
     }
 }
 

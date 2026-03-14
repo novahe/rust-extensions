@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::anyhow;
-use serde::Deserialize;
-use serde::Serialize;
+use prost_types::Any;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use prost_types::Any;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct JsonSpec {
@@ -456,6 +455,12 @@ pub struct Hook {
     pub timeout: i64,
 }
 
+impl Default for Process {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Process {
     pub fn new() -> Process {
         Process {
@@ -482,17 +487,17 @@ impl Process {
     }
 }
 
-const CRI_CONTAINERD_CONTAINER_TYPE_KEY: &'static str = "io.kubernetes.cri.container-type";
-const CRIO_CONTAINER_TYPE_KEY: &'static str = "io.kubernetes.cri-o.ContainerType";
-const DOCKERSHIM_CONTAINER_TYPE_KEY: &'static str = "io.kubernetes.docker.type";
+const CRI_CONTAINERD_CONTAINER_TYPE_KEY: &str = "io.kubernetes.cri.container-type";
+const CRIO_CONTAINER_TYPE_KEY: &str = "io.kubernetes.cri-o.ContainerType";
+const DOCKERSHIM_CONTAINER_TYPE_KEY: &str = "io.kubernetes.docker.type";
 
-const CONTAINER_TYPE_SANDBOX: &'static str = "sandbox";
-const CONTAINER_TYPE_PODSANDBOX: &'static str = "podsandbox";
-const CONTAINER_TYPE_CONTAINER: &'static str = "container";
+const CONTAINER_TYPE_SANDBOX: &str = "sandbox";
+const CONTAINER_TYPE_PODSANDBOX: &str = "podsandbox";
+const CONTAINER_TYPE_CONTAINER: &str = "container";
 
-const CRI_CONTAINERD_SANDBOX_ID_KEY: &'static str = "io.kubernetes.cri.sandbox-id";
-const CRIO_SANDBOX_ID_KEY: &'static str = "io.kubernetes.cri-o.SandboxID";
-const DOCKERSHIM_SANDBOX_ID_KEY: &'static str = "io.kubernetes.sandbox.id";
+const CRI_CONTAINERD_SANDBOX_ID_KEY: &str = "io.kubernetes.cri.sandbox-id";
+const CRIO_SANDBOX_ID_KEY: &str = "io.kubernetes.cri-o.SandboxID";
+const DOCKERSHIM_SANDBOX_ID_KEY: &str = "io.kubernetes.sandbox.id";
 
 #[derive(Debug)]
 pub enum ContainerType {
@@ -511,7 +516,7 @@ impl ContainerType {
                 _ => {}
             }
         }
-        return Self::Sandbox;
+        Self::Sandbox
     }
 }
 
@@ -551,23 +556,23 @@ pub fn to_any(spec: &JsonSpec) -> Result<Any> {
 
 impl From<&crate::types::Mount> for Mount {
     fn from(m: &crate::types::Mount) -> Self {
-        return Self {
+        Self {
             destination: "".to_string(),
             r#type: m.r#type.to_string(),
             source: m.source.to_string(),
             options: m.options.clone(),
-        };
+        }
     }
 }
 
 impl From<&Mount> for crate::types::Mount {
     fn from(m: &Mount) -> Self {
-        return Self {
+        Self {
             r#type: m.r#type.to_string(),
             source: m.source.to_string(),
             target: m.destination.to_string(),
             options: m.options.clone(),
-        };
+        }
     }
 }
 
@@ -842,7 +847,7 @@ mod tests {
     ]
   }
 }"#;
-        let spec = serde_json::from_str::<JsonSpec>(&spec_str).unwrap();
+        let spec = serde_json::from_str::<JsonSpec>(spec_str).unwrap();
         assert!(spec.vm.is_none());
         assert_eq!(
             spec.linux.unwrap().cgroups_path,

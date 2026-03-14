@@ -35,6 +35,8 @@ struct Service {
 #[async_trait]
 impl Shim for Service {
     type T = Service;
+    #[cfg(feature = "sandbox")]
+    type S = containerd_shim::asynchronous::NoopSandboxService;
 
     async fn new(_runtime_id: &str, _id: &str, _namespace: &str, _config: &mut Config) -> Self {
         Service {
@@ -42,7 +44,12 @@ impl Shim for Service {
         }
     }
 
-    async fn start_shim(&mut self, opts: StartOpts) -> Result<String, Error> {
+    #[cfg(feature = "sandbox")]
+    async fn create_sandbox_service(&self) -> Self::S {
+        containerd_shim::asynchronous::NoopSandboxService
+    }
+
+    async fn start_shim(&mut self, opts: StartOpts) -> containerd_shim::Result<String> {
         let grouping = opts.id.clone();
         let address = spawn(opts, &grouping, Vec::new()).await?;
         Ok(address)

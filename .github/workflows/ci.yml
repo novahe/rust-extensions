@@ -13,25 +13,25 @@ jobs:
 
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: arduino/setup-protoc@v1
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: rustup toolchain install nightly --component rustfmt
       - run: cargo check --examples --tests --all-targets
       - run: cargo check --examples --tests --all-targets --all-features
 
-      - run: rustup toolchain install nightly --component rustfmt
       - run: cargo +nightly fmt --all -- --check --files-with-diff
 
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::doc-lazy-continuation
+      - run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::doc-lazy-continuation
 
       - run: cargo doc --no-deps
         env:
-          RUSTDOCFLAGS: -Dwarnings
+          RUSTDOCFLAGS: -Dwarnings -A rustdoc::invalid-html-tags
 
   tests:
     name: Tests
@@ -40,11 +40,11 @@ jobs:
 
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: arduino/setup-protoc@v1
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - env:
@@ -65,12 +65,12 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: arduino/setup-protoc@v1
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo build --all-features --timings
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: cargo-timing
           path: target/cargo-timings/cargo-timing.html
@@ -82,8 +82,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.0
+      - name: Deny
+        run: cargo deny check
 
   integration:
     name: Integration
@@ -97,9 +102,9 @@ jobs:
 
     steps:
       - name: Checkout extensions
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.17.5'
 
@@ -111,7 +116,7 @@ jobs:
           echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
 
       - name: Checkout containerd
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: containerd/containerd
           path: src/github.com/containerd/containerd

@@ -107,7 +107,7 @@ async fn main() {
         .ok_or("First argument must be socket path")
         .unwrap();
 
-    let example = Example::default();
+    let example = Example;
 
     let incoming = {
         let uds = UnixListener::bind(socket_path).expect("Failed to bind listener");
@@ -153,9 +153,11 @@ mod unix {
         }
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Debug, Clone)]
     pub struct UdsConnectInfo {
+        #[allow(dead_code)]
         pub peer_addr: Option<Arc<tokio::net::unix::SocketAddr>>,
+        #[allow(dead_code)]
         pub peer_cred: Option<tokio::net::unix::UCred>,
     }
 

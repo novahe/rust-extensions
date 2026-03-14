@@ -73,6 +73,92 @@ pub mod monitor;
 pub mod publisher;
 pub mod util;
 
+#[cfg(feature = "sandbox")]
+#[derive(Clone, Default)]
+pub struct NoopSandboxService;
+
+#[cfg(feature = "sandbox")]
+impl containerd_shim_protos::sandbox::sandbox_ttrpc::Sandbox for NoopSandboxService {
+    fn create_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::CreateSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::CreateSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::CreateSandboxResponse::default())
+    }
+
+    fn start_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::StartSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::StartSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::StartSandboxResponse::default())
+    }
+
+    fn platform(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::PlatformRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::PlatformResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::PlatformResponse::default())
+    }
+
+    fn stop_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::StopSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::StopSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::StopSandboxResponse::default())
+    }
+
+    fn wait_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::WaitSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::WaitSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::WaitSandboxResponse::default())
+    }
+
+    fn sandbox_status(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::SandboxStatusRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::SandboxStatusResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::SandboxStatusResponse::default())
+    }
+
+    fn ping_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::PingRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<containerd_shim_protos::sandbox::sandbox::PingResponse>
+    {
+        Ok(containerd_shim_protos::sandbox::sandbox::PingResponse::default())
+    }
+
+    fn shutdown_sandbox(
+        &self,
+        _ctx: &containerd_shim_protos::ttrpc::Context,
+        _req: containerd_shim_protos::sandbox::sandbox::ShutdownSandboxRequest,
+    ) -> containerd_shim_protos::ttrpc::Result<
+        containerd_shim_protos::sandbox::sandbox::ShutdownSandboxResponse,
+    > {
+        Ok(containerd_shim_protos::sandbox::sandbox::ShutdownSandboxResponse::default())
+    }
+}
+
 pub mod console;
 
 /// Helper structure that wraps atomic bool to signal shim server when to shutdown the TTRPC server.
@@ -109,6 +195,10 @@ pub trait Shim {
     /// Type to provide task service for the shim.
     type T: Task + Send + Sync;
 
+    /// Type to provide sandbox service for the shim.
+    #[cfg(feature = "sandbox")]
+    type S: containerd_shim_protos::sandbox::sandbox_ttrpc::Sandbox + Send + Sync;
+
     /// Create a new instance of Shim.
     ///
     /// # Arguments
@@ -117,6 +207,10 @@ pub trait Shim {
     /// - `namespace`: namespace of the shim/container, passed in from Containerd.
     /// - `config`: for the shim to pass back configuration information
     fn new(runtime_id: &str, id: &str, namespace: &str, config: &mut Config) -> Self;
+
+    /// Create the sandbox service object.
+    #[cfg(feature = "sandbox")]
+    fn create_sandbox_service(&self) -> Self::S;
 
     /// Start shim will be called by containerd when launching new shim instance.
     ///

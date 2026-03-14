@@ -292,9 +292,7 @@ impl Process for CommonProcess {
                 })),
             );
         }
-        let console = Console {
-            file: f,
-        };
+        let console = Console { file: f };
         Ok(console)
     }
 

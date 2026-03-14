@@ -1,23 +1,21 @@
-use std::fmt::Debug;
-use std::path::Path;
-use std::sync::Arc;
+use std::{fmt::Debug, path::Path, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
+pub use cri::api::v1::PodSandboxConfig;
 use futures::TryFutureExt;
 use log::info;
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::{net::UnixListener, sync::Mutex};
 use tonic::transport::Server;
 
-pub use cri::api::v1::PodSandboxConfig;
-
-use crate::api::sandbox::v1::controller_server::ControllerServer;
-use crate::data::{ContainerData, SandboxData};
-use crate::error::Result;
-use crate::rpc::SandboxController;
-use crate::signal::ExitSignal;
+use crate::{
+    api::sandbox::v1::controller_server::ControllerServer,
+    data::{ContainerData, SandboxData},
+    error::Result,
+    rpc::SandboxController,
+    signal::ExitSignal,
+};
 
 pub mod args;
 pub mod base64;
@@ -70,7 +68,7 @@ pub struct ContainerOption {
 
 impl ContainerOption {
     pub fn new(container: ContainerData) -> Self {
-        return Self { container };
+        Self { container }
     }
 }
 
@@ -88,14 +86,14 @@ pub enum SandboxStatus {
     Paused,
 }
 
-impl ToString for SandboxStatus {
-    fn to_string(&self) -> String {
-        return match self {
-            Self::Created => "created".to_string(),
-            Self::Running(_) => "running".to_string(),
-            Self::Stopped(_, _) => "stopped".to_string(),
-            Self::Paused => "paused".to_string(),
-        };
+impl std::fmt::Display for SandboxStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Running(_) => write!(f, "running"),
+            Self::Stopped(_, _) => write!(f, "stopped"),
+            Self::Paused => write!(f, "paused"),
+        }
     }
 }
 
@@ -152,7 +150,7 @@ where
         .add_service(sandbox_server)
         .serve_with_incoming(incoming)
         .await
-        .with_context(|| format!("gRPC server"))?;
+        .with_context(|| "gRPC server".to_string())?;
 
     Ok(())
 }

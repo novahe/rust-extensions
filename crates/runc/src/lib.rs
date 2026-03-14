@@ -76,9 +76,10 @@ pub struct Version {
     pub commit: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum LogFormat {
     Json,
+    #[default]
     Text,
 }
 
@@ -88,12 +89,6 @@ impl Display for LogFormat {
             LogFormat::Json => write!(f, "{}", JSON),
             LogFormat::Text => write!(f, "{}", TEXT),
         }
-    }
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        LogFormat::Text
     }
 }
 
@@ -638,8 +633,6 @@ impl Runc {
 mod tests {
     use std::sync::Arc;
 
-    use time::OffsetDateTime;
-
     use super::{
         io::{InheritedStdIo, PipedStdIo},
         *,
@@ -1010,7 +1003,7 @@ mod tests {
         assert!(response.status.success());
         assert!(response.output.is_empty());
 
-        // test create cmd with pipe Io, expect nonempty cmd output
+        // test create cmd with pipe Io, expect empty cmd output because create uses launch_without_stdio
         let mut opts = CreateOpts::new();
         opts.io = Some(Arc::new(PipedStdIo::new().unwrap()));
         let response = echo_runc
@@ -1019,7 +1012,7 @@ mod tests {
             .expect("echo failed:");
         assert_ne!(response.pid, 0);
         assert!(response.status.success());
-        assert!(!response.output.is_empty());
+        assert!(response.output.is_empty());
     }
 }
 

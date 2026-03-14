@@ -1,14 +1,14 @@
-use std::collections::HashMap;
-use std::time::SystemTime;
+use std::{collections::HashMap, time::SystemTime};
 
 use log::warn;
 use prost::Message;
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tonic::Status;
 
-use crate::spec::{JsonSpec, Mount, Process};
-use crate::PodSandboxConfig;
+use crate::{
+    spec::{JsonSpec, Mount, Process},
+    PodSandboxConfig,
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxData {
@@ -68,7 +68,7 @@ impl SandboxData {
             netns: req.netns_path.to_string(),
             started_at: None,
             exited_at: None,
-            extensions: extensions,
+            extensions,
         }
     }
 

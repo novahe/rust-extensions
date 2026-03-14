@@ -22,8 +22,8 @@ use logging::{Config, Driver};
 fn pump(reader: fs::File) {
     io::BufReader::new(reader)
         .lines()
-        .filter_map(|line| line.ok())
-        .for_each(|_str| {
+        .map_while(Result::ok)
+        .for_each(|_line| {
             // Write log string to destination here.
             // For instance with journald:
             //  systemd::journal::print(0, &str);

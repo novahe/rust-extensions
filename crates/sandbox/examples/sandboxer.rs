@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use tokio::sync::{Mutex, RwLock};
-
-use containerd_sandbox::data::{ContainerData, SandboxData};
-use containerd_sandbox::error::Result;
-use containerd_sandbox::signal::ExitSignal;
 use containerd_sandbox::{
-    run, Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
+    data::{ContainerData, SandboxData},
+    error::Result,
+    run,
+    signal::ExitSignal,
+    Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
 };
+use tokio::sync::{Mutex, RwLock};
 
 pub struct ExampleSandboxer {
     sandboxes: Arc<RwLock<HashMap<String, Arc<Mutex<ExampleSandbox>>>>>,

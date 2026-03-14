@@ -6,12 +6,12 @@ use time::OffsetDateTime;
 use tokio::fs::{create_dir_all, remove_dir_all};
 use tonic::{Request, Response, Status};
 
-use crate::api::sandbox::v1::controller_server::Controller;
-use crate::api::sandbox::v1::*;
-use crate::data::{ContainerData, ProcessData, ProcessResource, SandboxData, TaskResources};
-use crate::{Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer};
-
-use crate::utils::cleanup_mounts;
+use crate::{
+    api::sandbox::v1::{controller_server::Controller, *},
+    data::{ContainerData, ProcessData, ProcessResource, SandboxData, TaskResources},
+    utils::cleanup_mounts,
+    Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
+};
 
 const SANDBOX_STATUS_READY: &str = "SANDBOX_READY";
 const SANDBOX_STATUS_NOTREADY: &str = "SANDBOX_NOTREADY";
@@ -57,7 +57,7 @@ where
         let base_dir = format!("{}/{}", self.dir, sandbox_data.id);
         create_dir_all(&*base_dir).await?;
         let opt = SandboxOption::new(base_dir.clone(), sandbox_data);
-        if let Err(e) = self.sandboxer.create(&*req.sandbox_id, opt).await {
+        if let Err(e) = self.sandboxer.create(&req.sandbox_id, opt).await {
             if let Err(re) = remove_dir_all(base_dir).await {
                 warn!("roll back in sandbox create rmdir: {}", re);
             }
@@ -105,7 +105,7 @@ where
                     .unwrap_or_default();
                 return Err(tonic::Status::new(
                     tonic::Code::Internal,
-                    format!("sandbox status is {}", status.to_string()),
+                    format!("sandbox status is {}", status),
                 ));
             }
         };
@@ -170,7 +170,7 @@ where
         };
 
         let mut data = {
-            let sandbox_mutex = self.sandboxer.sandbox(&*req.sandbox_id).await?;
+            let sandbox_mutex = self.sandboxer.sandbox(&req.sandbox_id).await?;
             let mut sandbox = sandbox_mutex.lock().await;
             let data = sandbox.get_data()?;
             let old_tasks = data.task_resources()?;
@@ -190,7 +190,7 @@ where
     ) -> Result<Response<ControllerStopResponse>, Status> {
         let req = request.get_ref();
         info!("stop sandbox {}", req.sandbox_id);
-        ignore_not_found!(self.sandboxer.stop(&*req.sandbox_id, true).await)?;
+        ignore_not_found!(self.sandboxer.stop(&req.sandbox_id, true).await)?;
         info!("stop sandbox {} returns successfully", req.sandbox_id);
         Ok(Response::new(ControllerStopResponse {}))
     }
@@ -201,13 +201,13 @@ where
     ) -> Result<tonic::Response<ControllerWaitResponse>, tonic::Status> {
         let req = request.get_ref();
         let exit_signal = {
-            let sandbox_mutex = self.sandboxer.sandbox(&*req.sandbox_id).await?;
+            let sandbox_mutex = self.sandboxer.sandbox(&req.sandbox_id).await?;
             let sandbox = sandbox_mutex.lock().await;
             sandbox.exit_signal().await?
         };
 
         exit_signal.wait().await;
-        let sandbox_mutex = self.sandboxer.sandbox(&*req.sandbox_id).await?;
+        let sandbox_mutex = self.sandboxer.sandbox(&req.sandbox_id).await?;
         let sandbox = sandbox_mutex.lock().await;
         let mut wait_resp = ControllerWaitResponse {
             exit_status: 0,
@@ -232,7 +232,7 @@ where
         request: tonic::Request<ControllerStatusRequest>,
     ) -> Result<tonic::Response<ControllerStatusResponse>, tonic::Status> {
         let req = request.get_ref();
-        let sandbox_mutex = self.sandboxer.sandbox(&*req.sandbox_id).await?;
+        let sandbox_mutex = self.sandboxer.sandbox(&req.sandbox_id).await?;
         let sandbox = sandbox_mutex.lock().await;
         // TODO the state should match the definition in containerd
         let (state, pid) = match sandbox.status()? {
@@ -259,7 +259,7 @@ where
             created_at,
             exited_at,
             extra: None,
-            address: address,
+            address,
             version: 2,
         }));
     }
@@ -270,7 +270,7 @@ where
     ) -> Result<tonic::Response<ControllerShutdownResponse>, tonic::Status> {
         let req = request.get_ref();
         info!("shutdown sandbox {}", req.sandbox_id);
-        ignore_not_found!(self.sandboxer.delete(&*req.sandbox_id).await)?;
+        ignore_not_found!(self.sandboxer.delete(&req.sandbox_id).await)?;
         let base_dir = format!("{}/{}", self.dir, req.sandbox_id);
         // Ignore clean up error
         cleanup_mounts(&base_dir).await.unwrap_or_default();
@@ -337,8 +337,8 @@ async fn update_process_resource<S>(
     sandbox_id: &str,
     sb: &mut S,
     task_id: &str,
-    processes: &Vec<ProcessResource>,
-    old_processes: &Vec<ProcessResource>,
+    processes: &[ProcessResource],
+    old_processes: &[ProcessResource],
 ) -> Result<(), Status>
 where
     S: Sandbox,

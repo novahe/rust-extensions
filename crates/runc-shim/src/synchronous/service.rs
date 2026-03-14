@@ -60,6 +60,8 @@ use crate::{
 
 impl Shim for Service {
     type T = ShimTask<RuncFactory, RuncContainer>;
+    #[cfg(feature = "sandbox")]
+    type S = containerd_shim::synchronous::NoopSandboxService;
 
     fn new(_runtime_id: &str, id: &str, namespace: &str, _config: &mut Config) -> Self {
         Service {
@@ -69,19 +71,21 @@ impl Shim for Service {
         }
     }
 
+    #[cfg(feature = "sandbox")]
+    fn create_sandbox_service(&self) -> Self::S {
+        containerd_shim::synchronous::NoopSandboxService
+    }
+
     fn start_shim(&mut self, opts: StartOpts) -> containerd_shim::Result<String> {
         let mut grouping = opts.id.clone();
         let spec = read_spec_from_file("")?;
-        match spec.annotations() {
-            Some(annotations) => {
-                for label in GROUP_LABELS.iter() {
-                    if let Some(value) = annotations.get(*label) {
-                        grouping = value.to_string();
-                        break;
-                    }
+        if let Some(annotations) = spec.annotations() {
+            for label in GROUP_LABELS.iter() {
+                if let Some(value) = annotations.get(*label) {
+                    grouping = value.to_string();
+                    break;
                 }
             }
-            None => {}
         }
 
         let (child_id, address) = spawn(opts, &grouping, Vec::new())?;

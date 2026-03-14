@@ -1,10 +1,11 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
 
-use tokio::sync::futures::Notified;
-use tokio::sync::Notify;
+use tokio::sync::{futures::Notified, Notify};
 
 /// Helper structure that wraps atomic bool to signal shim server when to shutdown the TTRPC server.
 ///
@@ -43,10 +44,10 @@ impl ExitSignal {
 
     pub fn exited(&self) -> Exited {
         let notified = self.notifier.notified();
-        return Exited {
+        Exited {
             notified,
-            sig: &self,
-        };
+            sig: self,
+        }
     }
 }
 
@@ -66,6 +67,6 @@ impl Future for Exited<'_> {
         if this.sig.exited.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
-        return this.notified.poll(cx);
+        this.notified.poll(cx)
     }
 }

@@ -1,6 +1,6 @@
-use serde::Deserialize;
-use serde::Serialize;
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PodSandboxConfig {

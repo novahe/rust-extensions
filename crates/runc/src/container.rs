@@ -53,7 +53,6 @@ pub struct Container {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
     use time::macros::datetime;
 
     use super::*;
