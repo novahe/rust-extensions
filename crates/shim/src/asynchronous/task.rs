@@ -31,6 +31,8 @@ use containerd_shim_protos::{
 use log::{debug, error, info, warn};
 use oci_spec::runtime::LinuxResources;
 use tokio::sync::{mpsc::Sender, MappedMutexGuard, Mutex, MutexGuard};
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     api::{
@@ -49,6 +51,48 @@ use crate::{
 };
 
 type EventSender = Sender<(String, Box<dyn MessageDyn>)>;
+
+/// Extract trace context from ttrpc metadata and return OpenTelemetry Context if present
+///
+/// This function extracts W3C Trace Context from ttrpc metadata headers.
+/// The ttrpc context should contain "traceparent" and optionally "tracestate" headers.
+///
+/// Note: This is a simplified implementation. For full W3C Trace Context support,
+/// the opentelemetry::propagation::TraceContext propagator should be used.
+fn extract_trace_context(ctx: &TtrpcContext) -> Option<opentelemetry::Context> {
+    let _metadata = &ctx.metadata;
+
+    // TODO: Implement full W3C Trace Context parsing
+    // The ttrpc metadata should contain:
+    // - "traceparent": "00-{trace_id}-{span_id}-{trace_flags}" (W3C format)
+    // - "tracestate": optional key=value pairs
+
+    // For now, we return None which means:
+    // - No parent span context will be set
+    // - A new trace root will be created (if tracing is enabled)
+    // This provides graceful degradation when trace context is not available
+
+    // Future implementation would:
+    // 1. Parse "traceparent" header from metadata
+    // 2. Extract trace_id, span_id, and trace_flags
+    // 3. Create an opentelemetry::Context with the trace info
+    // 4. Return Some(Context) for the span to use as parent
+
+    debug!("extract_trace_context called (TODO: implement W3C parsing)");
+    None
+}
+
+/// Set up tracing span with parent context from ttrpc metadata
+fn setup_traced_span(ctx: &TtrpcContext, method_name: &str) -> tracing::Span {
+    let span = tracing::info_span!(method_name);
+
+    // Try to extract and set parent trace context
+    if let Some(parent_cx) = extract_trace_context(ctx) {
+        span.set_parent(parent_cx);
+    }
+
+    span
+}
 
 /// TaskService is a Task template struct, it is considered a helper struct,
 /// which has already implemented `Task` trait, so that users can make it the type `T`
@@ -113,9 +157,12 @@ where
 
     async fn create(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: CreateTaskRequest,
     ) -> TtrpcResult<CreateTaskResponse> {
+        // Set up tracing span with potential parent context from ttrpc metadata
+        let _span = setup_traced_span(ctx, "TaskService::create").entered();
+
         info!("Create request for {:?}", &req);
         // Note: Get containers here is for getting the lock,
         // to make sure no other threads manipulate the containers metadata;
@@ -152,7 +199,8 @@ where
         Ok(resp)
     }
 
-    async fn start(&self, _ctx: &TtrpcContext, req: StartRequest) -> TtrpcResult<StartResponse> {
+    async fn start(&self, ctx: &TtrpcContext, req: StartRequest) -> TtrpcResult<StartResponse> {
+        let _span = setup_traced_span(ctx, "TaskService::start").entered();
         info!("Start request for {} {}", req.id(), req.exec_id());
         let mut container = self.get_container(req.id()).await?;
         let pid = container.start(req.exec_id.as_str().as_option()).await?;
@@ -190,7 +238,8 @@ where
         Ok(resp)
     }
 
-    async fn delete(&self, _ctx: &TtrpcContext, req: DeleteRequest) -> TtrpcResult<DeleteResponse> {
+    async fn delete(&self, ctx: &TtrpcContext, req: DeleteRequest) -> TtrpcResult<DeleteResponse> {
+        let _span = setup_traced_span(ctx, "TaskService::delete").entered();
         info!("Delete request for {} {}", req.id(), req.exec_id());
         let mut containers = self.containers.lock().await;
         let container = containers.get_mut(req.id()).ok_or_else(|| {
@@ -267,7 +316,8 @@ where
         Ok(Empty::new())
     }
 
-    async fn exec(&self, _ctx: &TtrpcContext, req: ExecProcessRequest) -> TtrpcResult<Empty> {
+    async fn exec(&self, ctx: &TtrpcContext, req: ExecProcessRequest) -> TtrpcResult<Empty> {
+        let _span = setup_traced_span(ctx, "TaskService::exec").entered();
         info!(
             "Exec request for container {} with exec_id {} and terminal {}",
             req.id(),
