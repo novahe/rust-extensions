@@ -129,8 +129,13 @@ impl Runc {
 
 #[cfg(not(feature = "async"))]
 impl Runc {
-    fn launch(&self, cmd: Command, combined_output: bool) -> Result<Response> {
-        let (status, pid, stdout, stderr) = self.spawner.execute(cmd)?;
+    fn launch(
+        &self,
+        cmd: Command,
+        combined_output: bool,
+        after_start: Box<dyn Fn() + Send>,
+    ) -> Result<Response> {
+        let (status, pid, stdout, stderr) = self.spawner.execute(cmd, after_start)?;
         if status.success() {
             let output = if combined_output {
                 stdout + stderr.as_str()
@@ -169,11 +174,16 @@ impl Runc {
         match opts {
             Some(CreateOpts { io: Some(io), .. }) => {
                 io.set(&mut cmd).map_err(|e| Error::IoSet(e.to_string()))?;
-                let res = self.launch(cmd, true)?;
-                io.close_after_start();
-                Ok(res)
+                let io_clone = io.clone();
+                self.launch(
+                    cmd,
+                    true,
+                    Box::new(move || {
+                        io_clone.close_after_start();
+                    }),
+                )
             }
-            _ => self.launch(cmd, true),
+            _ => self.launch(cmd, true, Box::new(|| {})),
         }
     }
 
@@ -184,7 +194,7 @@ impl Runc {
             args.append(&mut opts.args());
         }
         args.push(id.to_string());
-        self.launch(self.command(&args)?, true)?;
+        self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         Ok(())
     }
 
@@ -200,11 +210,17 @@ impl Runc {
         match opts {
             Some(ExecOpts { io: Some(io), .. }) => {
                 io.set(&mut cmd).map_err(|e| Error::IoSet(e.to_string()))?;
-                self.launch(cmd, true)?;
-                io.close_after_start();
+                let io_clone = io.clone();
+                self.launch(
+                    cmd,
+                    true,
+                    Box::new(move || {
+                        io_clone.close_after_start();
+                    }),
+                )?;
             }
             _ => {
-                self.launch(cmd, true)?;
+                self.launch(cmd, true, Box::new(|| {}))?;
             }
         }
         Ok(())
@@ -218,14 +234,14 @@ impl Runc {
         }
         args.push(id.to_string());
         args.push(sig.to_string());
-        let _ = self.launch(self.command(&args)?, true)?;
+        let _ = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         Ok(())
     }
 
     /// List all containers associated with this runc instance
     pub fn list(&self) -> Result<Vec<Container>> {
         let args = ["list".to_string(), "--format=json".to_string()];
-        let res = self.launch(self.command(&args)?, true)?;
+        let res = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         let output = res.output.trim();
 
         // Ugly hack to work around golang
@@ -239,14 +255,14 @@ impl Runc {
     /// Pause a container
     pub fn pause(&self, id: &str) -> Result<()> {
         let args = ["pause".to_string(), id.to_string()];
-        let _ = self.launch(self.command(&args)?, true)?;
+        let _ = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         Ok(())
     }
 
     /// Resume a container
     pub fn resume(&self, id: &str) -> Result<()> {
         let args = ["resume".to_string(), id.to_string()];
-        let _ = self.launch(self.command(&args)?, true)?;
+        let _ = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         Ok(())
     }
 
@@ -265,7 +281,7 @@ impl Runc {
             "--format=json".to_string(),
             id.to_string(),
         ];
-        let res = self.launch(self.command(&args)?, false)?;
+        let res = self.launch(self.command(&args)?, false, Box::new(|| {}))?;
         let output = res.output.trim();
 
         // Ugly hack to work around golang
@@ -293,27 +309,35 @@ impl Runc {
         let mut cmd = self.command(&args)?;
         if let Some(CreateOpts { io: Some(io), .. }) = opts {
             io.set(&mut cmd).map_err(|e| Error::IoSet(e.to_string()))?;
+            let io_clone = io.clone();
+            return self.launch(
+                cmd,
+                true,
+                Box::new(move || {
+                    io_clone.close_after_start();
+                }),
+            );
         };
-        self.launch(cmd, true)
+        self.launch(cmd, true, Box::new(|| {}))
     }
 
     /// Start an already created container
     pub fn start(&self, id: &str) -> Result<Response> {
         let args = ["start".to_string(), id.to_string()];
-        self.launch(self.command(&args)?, true)
+        self.launch(self.command(&args)?, true, Box::new(|| {}))
     }
 
     /// Return the state of a container
     pub fn state(&self, id: &str) -> Result<Container> {
         let args = ["state".to_string(), id.to_string()];
-        let res = self.launch(self.command(&args)?, true)?;
+        let res = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         serde_json::from_str(&res.output).map_err(Error::JsonDeserializationFailed)
     }
 
     /// Return the latest statistics for a container
     pub fn stats(&self, id: &str) -> Result<events::Stats> {
         let args = vec!["events".to_string(), "--stats".to_string(), id.to_string()];
-        let res = self.launch(self.command(&args)?, true)?;
+        let res = self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         let event: events::Event =
             serde_json::from_str(&res.output).map_err(Error::JsonDeserializationFailed)?;
         if let Some(stats) = event.stats {
@@ -332,7 +356,7 @@ impl Runc {
             filename,
             id.to_string(),
         ];
-        self.launch(self.command(&args)?, true)?;
+        self.launch(self.command(&args)?, true, Box::new(|| {}))?;
         Ok(())
     }
 }
@@ -356,7 +380,11 @@ macro_rules! tc {
 
 #[cfg(not(feature = "async"))]
 pub trait Spawner: Debug {
-    fn execute(&self, cmd: Command) -> Result<(ExitStatus, u32, String, String)>;
+    fn execute(
+        &self,
+        cmd: Command,
+        after_start: Box<dyn Fn() + Send>,
+    ) -> Result<(ExitStatus, u32, String, String)>;
 }
 
 #[cfg(feature = "async")]
@@ -376,10 +404,14 @@ pub trait Spawner: Debug {
 /// and some other utilities.
 #[cfg(feature = "async")]
 impl Runc {
-    async fn launch(&self, cmd: Command, combined_output: bool) -> Result<Response> {
+    async fn launch(
+        &self,
+        cmd: Command,
+        combined_output: bool,
+        after_start: Box<dyn Fn() + Send>,
+    ) -> Result<Response> {
         debug!("Execute command {:?}", cmd);
-        let (status, pid, stdout, stderr) =
-            self.spawner.execute(cmd, Box::new(|| {}), true).await?;
+        let (status, pid, stdout, stderr) = self.spawner.execute(cmd, after_start, true).await?;
         if status.success() {
             let output = if combined_output {
                 stdout + stderr.as_str()
@@ -390,28 +422,6 @@ impl Runc {
                 pid,
                 status,
                 output,
-            })
-        } else {
-            Err(Error::CommandFailed {
-                status,
-                stdout,
-                stderr,
-            })
-        }
-    }
-
-    async fn launch_without_stdio(
-        &self,
-        cmd: Command,
-        after_start: Box<dyn Fn() + Send>,
-    ) -> Result<Response> {
-        debug!("Execute command {:?}", cmd);
-        let (status, pid, stdout, stderr) = self.spawner.execute(cmd, after_start, false).await?;
-        if status.success() {
-            Ok(Response {
-                pid,
-                status,
-                output: "".to_string(),
             })
         } else {
             Err(Error::CommandFailed {
@@ -446,18 +456,16 @@ impl Runc {
             Some(CreateOpts { io: Some(io), .. }) => {
                 io.set(&mut cmd).map_err(Error::UnavailableIO)?;
                 let io_clone = io.clone();
-                let res = self
-                    .launch_without_stdio(
-                        cmd,
-                        Box::new(move || {
-                            io_clone.close_after_start();
-                        }),
-                    )
-                    .await?;
-                //io.close_after_start();
-                Ok(res)
+                self.launch(
+                    cmd,
+                    true,
+                    Box::new(move || {
+                        io_clone.close_after_start();
+                    }),
+                )
+                .await
             }
-            _ => self.launch_without_stdio(cmd, Box::new(|| {})).await,
+            _ => self.launch(cmd, true, Box::new(|| {})).await,
         }
     }
 
@@ -468,7 +476,9 @@ impl Runc {
             args.append(&mut opts.args());
         }
         args.push(id.to_string());
-        let _ = self.launch(self.command(&args)?, true).await?;
+        let _ = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         Ok(())
     }
 
@@ -492,11 +502,21 @@ impl Runc {
                     io.set(&mut cmd).map_err(|e| Error::IoSet(e.to_string())),
                     &f
                 );
-                tc!(self.launch(cmd, true).await, &f);
-                io.close_after_start();
+                let io_clone = io.clone();
+                tc!(
+                    self.launch(
+                        cmd,
+                        true,
+                        Box::new(move || {
+                            io_clone.close_after_start();
+                        })
+                    )
+                    .await,
+                    &f
+                );
             }
             _ => {
-                tc!(self.launch(cmd, true).await, &f);
+                tc!(self.launch(cmd, true, Box::new(|| {})).await, &f);
             }
         }
         let _ = tokio::fs::remove_file(&f).await;
@@ -511,14 +531,18 @@ impl Runc {
         }
         args.push(id.to_string());
         args.push(sig.to_string());
-        let _ = self.launch(self.command(&args)?, true).await?;
+        let _ = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         Ok(())
     }
 
     /// List all containers associated with this runc instance
     pub async fn list(&self) -> Result<Vec<Container>> {
         let args = ["list".to_string(), "--format=json".to_string()];
-        let res = self.launch(self.command(&args)?, true).await?;
+        let res = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         let output = res.output.trim();
 
         // Ugly hack to work around golang
@@ -532,14 +556,18 @@ impl Runc {
     /// Pause a container
     pub async fn pause(&self, id: &str) -> Result<()> {
         let args = ["pause".to_string(), id.to_string()];
-        let _ = self.launch(self.command(&args)?, true).await?;
+        let _ = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         Ok(())
     }
 
     /// Resume a container
     pub async fn resume(&self, id: &str) -> Result<()> {
         let args = ["resume".to_string(), id.to_string()];
-        let _ = self.launch(self.command(&args)?, true).await?;
+        let _ = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         Ok(())
     }
 
@@ -558,7 +586,9 @@ impl Runc {
             "--format=json".to_string(),
             id.to_string(),
         ];
-        let res = self.launch(self.command(&args)?, true).await?;
+        let res = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         let output = res.output.trim();
 
         // Ugly hack to work around golang
@@ -586,29 +616,46 @@ impl Runc {
         let mut cmd = self.command(&args)?;
         if let Some(CreateOpts { io: Some(io), .. }) = opts {
             io.set(&mut cmd).map_err(|e| Error::IoSet(e.to_string()))?;
+            let io_clone = io.clone();
+            let _ = self
+                .launch(
+                    cmd,
+                    true,
+                    Box::new(move || {
+                        io_clone.close_after_start();
+                    }),
+                )
+                .await?;
+            return Ok(());
         };
-        let _ = self.launch(cmd, true).await?;
+        let _ = self.launch(cmd, true, Box::new(|| {})).await?;
         Ok(())
     }
 
     /// Start an already created container
     pub async fn start(&self, id: &str) -> Result<()> {
         let args = vec!["start".to_string(), id.to_string()];
-        let _ = self.launch(self.command(&args)?, true).await?;
+        let _ = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         Ok(())
     }
 
     /// Return the state of a container
     pub async fn state(&self, id: &str) -> Result<Container> {
         let args = vec!["state".to_string(), id.to_string()];
-        let res = self.launch(self.command(&args)?, true).await?;
+        let res = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         serde_json::from_str(&res.output).map_err(Error::JsonDeserializationFailed)
     }
 
     /// Return the latest statistics for a container
     pub async fn stats(&self, id: &str) -> Result<events::Stats> {
         let args = vec!["events".to_string(), "--stats".to_string(), id.to_string()];
-        let res = self.launch(self.command(&args)?, true).await?;
+        let res = self
+            .launch(self.command(&args)?, true, Box::new(|| {}))
+            .await?;
         let event: events::Event =
             serde_json::from_str(&res.output).map_err(Error::JsonDeserializationFailed)?;
         if let Some(stats) = event.stats {
@@ -627,7 +674,11 @@ impl Runc {
             f.to_string(),
             id.to_string(),
         ];
-        let _ = tc!(self.launch(self.command(&args)?, true).await, &f);
+        let _ = tc!(
+            self.launch(self.command(&args)?, true, Box::new(|| {}))
+                .await,
+            &f
+        );
         let _ = tokio::fs::remove_file(&f).await;
         Ok(())
     }
@@ -637,8 +688,6 @@ impl Runc {
 #[cfg(all(target_os = "linux", not(feature = "async")))]
 mod tests {
     use std::sync::Arc;
-
-    use time::OffsetDateTime;
 
     use super::{
         io::{InheritedStdIo, PipedStdIo},
@@ -1032,11 +1081,12 @@ impl Spawner for DefaultExecutor {
     async fn execute(
         &self,
         cmd: Command,
-        _after_start: Box<dyn Fn() + Send>,
+        after_start: Box<dyn Fn() + Send>,
         wait_output: bool,
     ) -> Result<(ExitStatus, u32, String, String)> {
         let mut cmd = cmd;
         let mut child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
+        after_start();
         let pid = child.id().unwrap();
         return if wait_output {
             let output = child
@@ -1053,11 +1103,86 @@ impl Spawner for DefaultExecutor {
     }
 }
 
+#[cfg(test)]
+#[cfg(feature = "async")]
+mod default_executor_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_default_executor_runs_after_start() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+        let executor = DefaultExecutor {};
+        let executable = std::env::current_exe().expect("current test executable is missing");
+        let mut cmd = Command::new(executable);
+        cmd.arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        executor
+            .execute(
+                cmd,
+                Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                }),
+                false,
+            )
+            .await
+            .expect("true failed");
+
+        assert!(called.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "async"))]
+mod default_executor_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_default_executor_runs_after_start() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+        let executor = DefaultExecutor {};
+        let executable = std::env::current_exe().expect("current test executable is missing");
+        let mut cmd = Command::new(executable);
+        cmd.arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        executor
+            .execute(
+                cmd,
+                Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                }),
+            )
+            .expect("true failed");
+
+        assert!(called.load(Ordering::SeqCst));
+    }
+}
+
 #[cfg(not(feature = "async"))]
 impl Spawner for DefaultExecutor {
-    fn execute(&self, cmd: Command) -> Result<(ExitStatus, u32, String, String)> {
+    fn execute(
+        &self,
+        cmd: Command,
+        after_start: Box<dyn Fn() + Send>,
+    ) -> Result<(ExitStatus, u32, String, String)> {
         let mut cmd = cmd;
         let child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
+        after_start();
         let pid = child.id();
         let result = child.wait_with_output().map_err(Error::InvalidCommand)?;
         let status = result.status;

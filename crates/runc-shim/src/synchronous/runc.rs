@@ -643,7 +643,11 @@ impl TryFrom<ExecProcessRequest> for ExecProcess {
 }
 
 impl Spawner for ShimExecutor {
-    fn execute(&self, cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
+    fn execute(
+        &self,
+        cmd: Command,
+        after_start: Box<dyn Fn() + Send>,
+    ) -> runc::Result<(ExitStatus, u32, String, String)> {
         let mut cmd = cmd;
         let subscription =
             monitor_subscribe(Topic::Pid).map_err(|e| runc::error::Error::Other(Box::new(e)))?;
@@ -653,6 +657,7 @@ impl Spawner for ShimExecutor {
                 return Err(runc::error::Error::ProcessSpawnFailed(e));
             }
         };
+        after_start();
         let pid = child.id();
         // May block here when stream exceeds buffer size, it's better to spawn another thread for io copy
         let (stdout, stderr, exit_code) = (
